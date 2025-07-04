@@ -1,0 +1,43 @@
+version: 1.0.1
+type: plugin
+author: aliyun-security
+name: ai_guardrails
+label:
+  en_US: Ai Guardrails
+  ja_JP: Ai Guardrails
+  zh_Hans: AI安全护栏
+  pt_BR: Ai Guardrails
+description:
+  en_US: Ai Guardrails
+  ja_JP: Ai Guardrails
+  zh_Hans: AI安全护栏
+  pt_BR: Ai Guardrails
+icon: icon.svg
+resource:
+  memory: 268435456
+  permission:
+    node:
+      enabled: false
+    endpoint:
+      enabled: false
+    app:
+      enabled: false
+    storage:
+      enabled: false
+      size: 1024
+plugins:
+  tools:
+    - provider/ai_guardrails.yaml
+meta:
+  version: 1.0.1
+  arch:
+    - amd64
+    - arm64
+  runner:
+    language: python
+    version: "3.12"
+    entrypoint: main
+  minimum_dify_version: null
+created_at: 2025-05-20T10:52:51.568935+08:00
+privacy: PRIVACY.md
+verified: false
