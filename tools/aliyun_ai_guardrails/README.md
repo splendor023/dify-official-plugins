@@ -21,12 +21,15 @@ https://help.aliyun.com/zh/ram/user-guide/create-an-accesskey-pair
 ### 3. Use the plugin in the workflow application.
 
 1. Select the modal type
+
 ![](./_assets/modal_type.jpg)
 
 2. Select the detect type
+
 ![](./_assets/detect_type.jpg)
 
 3. Based on the selected config text content, image URL, and file URL.
+
 ![](./_assets/input_variables.jpg)
 
 
