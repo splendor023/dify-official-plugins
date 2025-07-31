@@ -10,7 +10,7 @@ AI Guardrails is a security protection product designed by Alibaba Cloud for art
 
 Get Aliyun AccessKey ID and Secret from [Aliyun](https://www.aliyun.com/), for more getting tutorial:
 
-- **Create AccessKey**: 
+- Create AccessKey: 
 https://help.aliyun.com/zh/ram/user-guide/create-an-accesskey-pair
 
 
@@ -22,15 +22,15 @@ https://help.aliyun.com/zh/ram/user-guide/create-an-accesskey-pair
 
 1. Select the modal type
 
-![](./_assets/modal_type.jpg)
+    ![](./_assets/modal_type.jpg)
 
 2. Select the detect type
 
-![](./_assets/detect_type.jpg)
+    ![](./_assets/detect_type.jpg)
 
 3. Based on the selected config text content, image URL, and file URL.
 
-![](./_assets/input_variables.jpg)
+    ![](./_assets/input_variables.jpg)
 
 
 

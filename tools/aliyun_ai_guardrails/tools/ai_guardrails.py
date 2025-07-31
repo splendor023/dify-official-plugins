@@ -215,6 +215,7 @@ class AiGuardrailsTool(Tool):
             maliciousUrlSuggestion=""
             maliciousFileSuggestion=""
             waterMark=""
+            desensitization=""
             _finalSuggestion="pass"
 
             # 遍历bodys
@@ -230,6 +231,7 @@ class AiGuardrailsTool(Tool):
                         if suggestion and contentModerationSuggestion!="block" :
                             contentModerationSuggestion = suggestion
                     elif type == "sensitiveData":
+                        desensitization = detail.get("Result",[])[0].get("Ext",{}).get("Desensitization","")
                         if suggestion and sensitiveDataSuggestion!="block" :
                             sensitiveDataSuggestion = suggestion
                     elif type == "promptAttack":
@@ -251,6 +253,7 @@ class AiGuardrailsTool(Tool):
             yield self.create_variable_message("maliciousUrlSuggestion", maliciousUrlSuggestion)
             yield self.create_variable_message("maliciousFileSuggestion", maliciousFileSuggestion)
             yield self.create_variable_message("waterMark", waterMark)
+            yield self.create_variable_message("desensitization", desensitization)
             yield self.create_variable_message("_finalSuggestion", _finalSuggestion) 
             
         except Exception as e:

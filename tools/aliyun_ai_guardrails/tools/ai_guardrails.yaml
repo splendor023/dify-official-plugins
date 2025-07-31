@@ -2,12 +2,12 @@ identity:
   name: ai_guardrails # 工具的唯一内部名称
   author: aliyun-security
   label: # 在 Dify UI 中显示的工具名称 (多语言)
-    en_US: Ai Guardrails
-    zh_Hans: AI安全护栏
+    en_US: Alibaba Cloud AI Guardrails
+    zh_Hans: 阿里云AI安全护栏
 description: # 给人类用户看的工具描述 (多语言)
   human:
-    en_US: Ai Guardrails
-    zh_Hans: AI安全护栏
+    en_US: Alibaba Cloud AI Guardrails
+    zh_Hans: 阿里云AI安全护栏
   llm: 大模型输入输出的安全防护 # 给 LLM 看的工具描述 (用于 Agent 模式)
 parameters:
   - name: modalType
@@ -72,12 +72,12 @@ parameters:
     required: false # 是否必需
     label: # 在 Dify UI 中显示的参数标签 (多语言)
         en_US: FileUrl
-        zh_Hans: 检测的文件内容
+        zh_Hans: 检测的文件地址
     human_description: # 给人类用户看的参数描述 (多语言)
         en_US: File url to be detected
-        zh_Hans: 检测的文件内容
+        zh_Hans: 检测的文件地址
     llm_description: # 给 LLM 看的参数描述 (指导 Agent 如何填充)
-        检测的文件内容
+        检测的文件地址
     form: llm # 参数表单类型 ('llm' 或 'form')
   - name: type
     type: select
@@ -124,6 +124,9 @@ output_schema:
     _finalSuggestion:
       type: string
       description: 综合防护建议
+    desensitization:
+      type: string
+      description: 脱敏后的文本内容
   additionalProperties: false
 extra:
   python:
