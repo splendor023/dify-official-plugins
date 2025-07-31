@@ -2,11 +2,11 @@ identity:
   author: aliyun-security
   name: ai_guardrails
   label:
-    en_US: Ai Guardrails
-    zh_Hans: AI安全护栏
+    en_US: Alibaba Cloud AI Guardrails
+    zh_Hans: 阿里云AI安全护栏
   description:
-    en_US: Ai Guardrails
-    zh_Hans: AI安全护栏
+    en_US: Alibaba Cloud AI Guardrails
+    zh_Hans: 阿里云AI安全护栏
   icon: icon.svg
 tools:
   - tools/ai_guardrails.yaml
