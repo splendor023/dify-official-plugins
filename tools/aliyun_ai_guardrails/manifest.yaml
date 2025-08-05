@@ -8,10 +8,10 @@ label:
   zh_Hans: 阿里云AI安全护栏
   pt_BR: Alibaba Cloud AI Guardrails
 description:
-  en_US: The AI Guardrail API service provided by Alibaba Cloud Security
-  ja_JP: The AI Guardrail API service provided by Alibaba Cloud Security
-  zh_Hans: 阿里云安全提供的AI安全护栏API服务
-  pt_BR: The AI Guardrail API service provided by Alibaba Cloud Security
+  en_US: The AI Guardrail API service provided by Alibaba Cloud Security, safeguard your models and AI applications.
+  ja_JP: The AI Guardrail API service provided by Alibaba Cloud Security, safeguard your models and AI applications.
+  zh_Hans: 阿里云安全提供的AI安全护栏API服务，保障大模型安全。
+  pt_BR: The AI Guardrail API service provided by Alibaba Cloud Security, safeguard your models and AI applications.
 icon: icon.svg
 resource:
   memory: 268435456
