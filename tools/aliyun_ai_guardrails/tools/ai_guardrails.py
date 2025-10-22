@@ -155,6 +155,9 @@ class AiGuardrailsTool(Tool):
         # 3. 调用库执行操作
         def request(service, params):
 
+            # 给params添加来源参数
+            params["requestFrom"] = "DifyPlugin"
+            
             # 3.1 构造请求参数
             parameters = {
                 "Action": "MultiModalGuard",
@@ -214,6 +217,7 @@ class AiGuardrailsTool(Tool):
             promptAttackSuggestion=""
             maliciousUrlSuggestion=""
             maliciousFileSuggestion=""
+            customLabelSuggestion=""
             waterMark=""
             desensitization=""
             _finalSuggestion="pass"
@@ -245,6 +249,9 @@ class AiGuardrailsTool(Tool):
                             maliciousFileSuggestion = suggestion
                     elif type == "waterMark":
                         waterMark = detail.get("Result",[])[0].get("Ext",{}).get("FileUrl","")
+                    elif type == "customLabel":
+                        if suggestion and customLabelSuggestion!="block" :
+                            customLabelSuggestion = suggestion
 
             # 变量输出 (用于工作流)
             yield self.create_variable_message("contentModerationSuggestion", contentModerationSuggestion)
@@ -252,6 +259,7 @@ class AiGuardrailsTool(Tool):
             yield self.create_variable_message("promptAttackSuggestion", promptAttackSuggestion)
             yield self.create_variable_message("maliciousUrlSuggestion", maliciousUrlSuggestion)
             yield self.create_variable_message("maliciousFileSuggestion", maliciousFileSuggestion)
+            yield self.create_variable_message("customLabelSuggestion", customLabelSuggestion)
             yield self.create_variable_message("waterMark", waterMark)
             yield self.create_variable_message("desensitization", desensitization)
             yield self.create_variable_message("_finalSuggestion", _finalSuggestion) 

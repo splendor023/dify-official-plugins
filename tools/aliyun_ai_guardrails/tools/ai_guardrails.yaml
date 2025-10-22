@@ -118,6 +118,9 @@ output_schema:
     maliciousFileSuggestion:
       type: string
       description: 恶意文件建议
+    customLabelSuggestion:
+      type: string
+      description: 自定义检测Agent建议
     waterMark:
       type: string
       description: 水印图片地址
