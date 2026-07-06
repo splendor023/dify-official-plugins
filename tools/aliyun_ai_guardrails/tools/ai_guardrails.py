@@ -15,7 +15,6 @@ from dify_plugin.entities.tool import ToolInvokeMessage
 import concurrent.futures
 from functools import partial
 
-SERVICE_URL = "https://green-cip.cn-shanghai.aliyuncs.com"
 ENCODING = "UTF-8"
 ISO8601_DATE_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 ALGORITHM = "HmacSHA1"
@@ -98,59 +97,88 @@ class AiGuardrailsTool(Tool):
         except KeyError:
             raise Exception("阿里云 Access Secret 未配置或无效。请在插件设置中提供。")
 
+        # 从凭证中读取 region，默认使用 cn-shanghai
+        region = self.runtime.credentials.get("region", "cn-shanghai")
+        service_url = f"https://green-cip.{region}.aliyuncs.com"
+
         # 2. 获取工具输入参数
         content = tool_parameters.get("content", "")  # 使用 .get 提供默认值
         type = tool_parameters.get("type", "")
         modalType = tool_parameters.get("modalType", "")
         imageUrl = tool_parameters.get("imageUrl", "")
         fileUrl = tool_parameters.get("fileUrl", "")
+        customService = tool_parameters.get("customService", "")
         service = ""
         params = {}
-        
-        if not modalType:
-            raise Exception("模态不能为空。")
-        if modalType=="text" and not content:
-            raise Exception("检测文本内容不能为空。")
-        if modalType=="image" and not imageUrl:
-            raise Exception("检测图片地址不能为空。")
-        if modalType=="file" and not fileUrl:
-            raise Exception("检测文件地址不能为空。")
-        if modalType=="modal_text_file" and (not fileUrl or not content):
-            raise Exception("检测文件地址和文本内容不能为空。")
-        if modalType=="modal_text_image" and (not imageUrl or not content):
-            raise Exception("检测图片地址和文本内容不能为空。")
-        if not type:
-            raise Exception("检测类型不能为空。")
-        
-        # 文本模态才支持长文
-        if modalType!="text" and len(content) > MAX_LENGTH :
-            raise Exception(f"文本内容不能超过{MAX_LENGTH}字符。")
-        
-        if modalType=="text" and type == "input" :
-            service = "query_security_check"
-            params = {"content": content}
-        elif modalType=="text" and type == "output" :
-            service = "response_security_check"
-            params = {"content": content}
-        elif modalType=="image" and type == "input" :
-            service = "img_query_security_check"
-            params = {"imageUrls":[imageUrl]}
-        elif modalType=="image" and type == "output" :
-            service = "img_response_security_check"
-            params = {"imageUrls":[imageUrl]}
-        elif modalType=="file" :
-            service = "file_security_sync_check"
-            params = {"fileUrls":[fileUrl]}
-        elif modalType=="modal_text_file" :
-            service = "text_file_sec_sync_check"
-            params = {"content": content, "fileUrls":[fileUrl]}
-        elif modalType=="modal_text_image" :
-            service = "text_img_security_check"
-            params = {"content": content, "imageUrls":[imageUrl]}
 
-        #将长文本拆分成2000一段
-        if modalType=="text" :
-            contents = [content] if len(content) <= MAX_LENGTH else split_text(content, MAX_LENGTH-50)
+        if customService or modalType == "custom" or type == "custom":
+            # 用户选择了自定义服务，直接使用
+            if not customService:
+                raise Exception("选择了'自定义'时，必须填写自定义服务名称。")
+            if modalType != "custom" or type != "custom":
+                raise Exception("填写了自定义服务时，模态类型和检测类型均需选择'自定义'。")
+            service = customService
+            if content and imageUrl:
+                params = {"content": content, "imageUrls": [imageUrl]}
+            elif content and fileUrl:
+                params = {"content": content, "fileUrls": [fileUrl]}
+            elif content:
+                params = {"content": content}
+            elif imageUrl:
+                params = {"imageUrls": [imageUrl]}
+            elif fileUrl:
+                params = {"fileUrls": [fileUrl]}
+        else:
+            # 未填写自定义服务，使用原有 modalType + type 路由逻辑
+            if not modalType:
+                raise Exception("模态不能为空。")
+            if modalType=="text" and not content:
+                raise Exception("检测文本内容不能为空。")
+            if modalType=="image" and not imageUrl:
+                raise Exception("检测图片地址不能为空。")
+            if modalType=="file" and not fileUrl:
+                raise Exception("检测文件地址不能为空。")
+            if modalType=="modal_text_file" and (not fileUrl or not content):
+                raise Exception("检测文件地址和文本内容不能为空。")
+            if modalType=="modal_text_image" and (not imageUrl or not content):
+                raise Exception("检测图片地址和文本内容不能为空。")
+            if not type:
+                raise Exception("检测类型不能为空。")
+
+            # 文本模态才支持长文
+            if modalType!="text" and len(content) > MAX_LENGTH :
+                raise Exception(f"文本内容不能超过{MAX_LENGTH}字符。")
+
+            if modalType=="text" and type == "input" :
+                service = "query_security_check"
+                params = {"content": content}
+            elif modalType=="text" and type == "output" :
+                service = "response_security_check"
+                params = {"content": content}
+            elif modalType=="image" and type == "input" :
+                service = "img_query_security_check"
+                params = {"imageUrls":[imageUrl]}
+            elif modalType=="image" and type == "output" :
+                service = "img_response_security_check"
+                params = {"imageUrls":[imageUrl]}
+            elif modalType=="file" :
+                service = "file_security_sync_check"
+                params = {"fileUrls":[fileUrl]}
+            elif modalType=="modal_text_file" :
+                service = "text_file_sec_sync_check"
+                params = {"content": content, "fileUrls":[fileUrl]}
+            elif modalType=="modal_text_image" :
+                service = "text_img_security_check"
+                params = {"content": content, "imageUrls":[imageUrl]}
+
+        #将长文本拆分成2000一段（纯文本场景：params 只有 content，没有图片/文件）
+        is_text_only = "content" in params and "imageUrls" not in params and "fileUrls" not in params
+        if is_text_only and content and len(content) > MAX_LENGTH:
+            contents = split_text(content, MAX_LENGTH-50)
+        elif is_text_only and content:
+            contents = [content]
+        else:
+            contents = None
 
         # 3. 调用库执行操作
         def request(service, params):
@@ -177,7 +205,7 @@ class AiGuardrailsTool(Tool):
             parameters["Signature"] = signature
             
             # 3.2 发送请求
-            response = requests.post(SERVICE_URL, data=parameters)
+            response = requests.post(service_url, data=parameters)
             body = response.json()
 
             if response.status_code != 200:
@@ -194,9 +222,9 @@ class AiGuardrailsTool(Tool):
         
         try:
             
-            # 只有文本的需要并发执行
+            # 纯文本且需要切分时并发执行
             bodys = []
-            if modalType=="text":
+            if contents:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                     futures = [executor.submit(request, service, {"content": seg}) for seg in contents]
                     for future in concurrent.futures.as_completed(futures):

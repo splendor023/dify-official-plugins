@@ -42,6 +42,10 @@ parameters:
         label: 
           en_US: MultiModal(Text And File)
           zh_Hans: 多模态（文本文件）
+      - value: custom
+        label: 
+          en_US: Custom
+          zh_Hans: 自定义
     form: form
   - name: content # 参数的内部名称，与 Python 代码中的 key 对应
     type: string # 参数类型
@@ -99,6 +103,21 @@ parameters:
         label: 
           en_US: output
           zh_Hans: 输出
+      - value: custom
+        label: 
+          en_US: Custom
+          zh_Hans: 自定义
+    form: form
+  - name: customService
+    type: string
+    required: false
+    label:
+        en_US: Custom Service (Optional)
+        zh_Hans: 自定义服务（可选）
+    human_description:
+        en_US: Custom service name. Please select "Custom" in Modal Type and Detection Type above.
+        zh_Hans: 自定义服务名称。使用时请在上方模态类型和检测类型中选择“自定义”。
+    llm_description: 自定义服务名称，使用时需将模态类型和检测类型选为“自定义”
     form: form
 output_schema:
   type: object

@@ -46,3 +46,36 @@ credentials_for_provider:
           zh_Hans: 如何获取阿里云 AccessKey Secret
           # ... (其他语言)
       url: https://help.aliyun.com/zh/ram/user-guide/create-an-accesskey-pair # 点击帮助提示时跳转的 URL
+    region: # 服务地域，用于拼接 API 请求地址
+        type: select # 输入类型为下拉选择
+        required: true # 此配置是必需的
+        label: # 在 Dify UI 中显示的标签 (支持多语言)
+            en_US: Region
+            zh_Hans: 地域
+            # ... (其他语言)
+        help: # 帮助提示信息 (支持多语言)
+            en_US: Alibaba Cloud region for AI Guardrails service
+            zh_Hans: 阿里云AI安全护栏服务地域
+            # ... (其他语言)
+        options: # 可选地域列表
+          - value: cn-shanghai
+            label:
+              en_US: China (Shanghai)
+              zh_Hans: 华东2（上海）
+          - value: cn-beijing
+            label:
+              en_US: China (Beijing)
+              zh_Hans: 华北2（北京）
+          - value: cn-hangzhou
+            label:
+              en_US: China (Hangzhou)
+              zh_Hans: 华东1（杭州）
+          - value: cn-shenzhen
+            label:
+              en_US: China (Shenzhen)
+              zh_Hans: 华南1（深圳）
+          - value: ap-southeast-1
+            label:
+              en_US: Singapore
+              zh_Hans: 新加坡
+    #todo: 添加更多凭证

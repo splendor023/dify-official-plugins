@@ -1,4 +1,4 @@
-version: 1.0.3
+version: 1.0.4
 type: plugin
 author: aliyun-security
 name: ai_guardrails
@@ -29,7 +29,7 @@ plugins:
   tools:
     - provider/ai_guardrails.yaml
 meta:
-  version: 1.0.3
+  version: 1.0.4
   arch:
     - amd64
     - arm64
