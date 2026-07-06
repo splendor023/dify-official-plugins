@@ -1,0 +1,24 @@
+[project]
+name = "lemonade"
+version = "0.1.0"
+description = "Lemonade lets you run local models with NPU and GPU acceleration"
+readme = "README.md"
+requires-python = ">=3.12"
+
+# Managed with uv; refresh the lockfile with `uv lock`.
+dependencies = [
+    "dify-plugin>=0.9.0",
+    "httpx>=0.28.1",
+    "openai>=2.38.0",
+    "requests>=2.34.2",
+    "setuptools>=82.0.1",
+]
+
+# uv run black . -C -l 100
+# uv run ruff check --fix
+[dependency-groups]
+dev = [
+    "black>=26.5.1",
+    "pytest>=9.0.3",
+    "ruff>=0.15.14",
+]

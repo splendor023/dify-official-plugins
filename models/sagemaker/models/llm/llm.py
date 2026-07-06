@@ -1,4 +1,5 @@
 import json
+import time
 import logging
 import re
 from collections.abc import Generator, Iterator
@@ -50,7 +51,7 @@ from dify_plugin.interfaces.model.large_language_model import LargeLanguageModel
 logger = logging.getLogger(__name__)
 
 
-def inference(predictor, messages: list[dict[str, Any]], params: dict[str, Any], stop: list, stream=False):
+def inference(predictor, messages: list[dict[str, Any]], params: dict[str, Any], stop: list, model_id: str, stream=False):
     """
     params:
     predictor : Sagemaker Predictor
@@ -60,6 +61,7 @@ def inference(predictor, messages: list[dict[str, Any]], params: dict[str, Any],
                 {"role": "user", "content": "who are you? what are you doing?"},
             ]
     params (Dict[str,Any]): model parameters for LLM。
+    model_id (str): model identifier。
     stream (bool): False by default。
 
     response:
@@ -67,12 +69,13 @@ def inference(predictor, messages: list[dict[str, Any]], params: dict[str, Any],
     Iterator of Chunks if stream is True
     """
     payload = {
-        "stop": stop,
+        "model": model_id,
         "messages": messages,
         "stream": stream,
         "max_tokens": params.get("max_new_tokens", params.get("max_tokens", 2048)),
         "temperature": params.get("temperature", 0.1),
         "top_p": params.get("top_p", 0.9),
+        "stop": stop,
     }
 
     if not stream:
@@ -91,9 +94,10 @@ class SageMakerLargeLanguageModel(LargeLanguageModel):
     sagemaker_session: Any = None
     predictor: Any = None
     sagemaker_endpoint: str | None = None
-    access_key: str = None 
-    secret_key : str = None 
-    aws_region : str = None 
+    access_key: str = None
+    secret_key : str = None
+    aws_region : str = None
+    assume_role_arn : str = None 
 
     def _handle_chat_generate_response(
         self,
@@ -145,7 +149,16 @@ class SageMakerLargeLanguageModel(LargeLanguageModel):
         full_response = ""
         buffer = ""
         for chunk_bytes in resp:
-            chunk_json_str = chunk_bytes.decode("utf-8")
+            # Handle None or empty chunks from sporadic model output anomalies
+            if not chunk_bytes:
+                logger.warning("Received empty or None chunk from SageMaker stream, skipping...")
+                continue
+
+            try:
+                chunk_json_str = chunk_bytes.decode("utf-8")
+            except (UnicodeDecodeError, AttributeError) as e:
+                logger.warning(f"Failed to decode chunk: {e}, skipping...")
+                continue
             if chunk_json_str.startswith("data: "):
                 chunk_json_str = chunk_json_str[len("data: "):]
 
@@ -215,6 +228,28 @@ class SageMakerLargeLanguageModel(LargeLanguageModel):
                 logger.info("json parse exception, content: {}".format(buffer))
                 pass
 
+    def _refresh_token(self):
+        " Refresh tokens by calling assume_role again "
+        params = {
+            "RoleArn": self.assume_role_arn,
+            "DurationSeconds": 3600,
+            "RoleSessionName": f"gain-sagemaker-session-{int(time.time())}"
+        }
+
+        boto_session = boto3.Session(region_name=self.aws_region)
+        sts_client = boto_session.client("sts")
+
+        response = sts_client.assume_role(**params).get("Credentials")
+
+        credentials = {
+            "access_key": response.get("AccessKeyId"),
+            "secret_key": response.get("SecretAccessKey"),
+            "token": response.get("SessionToken"),
+            "expiry_time": response.get("Expiration").isoformat(),
+        }
+
+        return credentials
+
     def _invoke(
         self,
         model: str,
@@ -239,13 +274,17 @@ class SageMakerLargeLanguageModel(LargeLanguageModel):
         :param user: unique user id
         :return: full response or stream response chunk generator result
         """
-        if self.access_key != credentials.get("aws_access_key_id") or self.secret_key != credentials.get("aws_secret_access_key") or \
-            self.aws_region != credentials.get("aws_region") or self.sagemaker_endpoint != credentials.get("sagemaker_endpoint"):
+        if self.access_key != credentials.get("aws_access_key_id") or \
+            self.secret_key != credentials.get("aws_secret_access_key") or \
+            self.aws_region != credentials.get("aws_region") or \
+            self.assume_role_arn != credentials.get("assume_role_arn") or \
+            self.sagemaker_endpoint != credentials.get("sagemaker_endpoint"):
 
             # All settings are not changed
             self.access_key = credentials.get("aws_access_key_id")
             self.secret_key = credentials.get("aws_secret_access_key")
             self.aws_region = credentials.get("aws_region")
+            self.assume_role_arn = credentials.get("assume_role_arn")
             self.sagemaker_endpoint = credentials.get("sagemaker_endpoint")
 
             boto_session = None
@@ -259,6 +298,24 @@ class SageMakerLargeLanguageModel(LargeLanguageModel):
             else:
                 boto_session = boto3.Session()
 
+            # If assume role arn is specified, assume the role
+            if self.assume_role_arn:
+
+                from botocore.credentials import RefreshableCredentials
+                from botocore.session import get_session
+
+                session_credentials = RefreshableCredentials.create_from_metadata(
+                    metadata=self._refresh_token(),
+                    refresh_using=self._refresh_token,
+                    method="sts-assume-role"
+                )
+
+                session = get_session()
+                session._credentials = session_credentials
+                session.set_config_variable("region", self.aws_region)
+
+                boto_session = boto3.Session(botocore_session=session)
+
             sagemaker_client = boto_session.client("sagemaker")
             self.sagemaker_session = Session(boto_session=boto_session, sagemaker_client=sagemaker_client)
             self.predictor = Predictor(
@@ -267,9 +324,9 @@ class SageMakerLargeLanguageModel(LargeLanguageModel):
                 serializer=serializers.JSONSerializer(),
             )
 
-        messages: list[dict[str, Any]] = [{"role": p.role.value, "content": p.content} for p in prompt_messages]
+        messages: list[dict[str, Any]] = [self._convert_prompt_message_to_dict(p) for p in prompt_messages]
         response = inference(
-            predictor=self.predictor, messages=messages, params=model_parameters, stop=stop, stream=stream
+            predictor=self.predictor, messages=messages, params=model_parameters, stop=stop, model_id=credentials.get("model_id", ""), stream=stream
         )
 
         if stream:
@@ -446,13 +503,13 @@ class SageMakerLargeLanguageModel(LargeLanguageModel):
                 name="temperature",
                 type=ParameterType.FLOAT,
                 use_template="temperature",
-                label=I18nObject(zh_Hans="温度", en_US="Temperature"),
+                label=I18nObject(zh_hans="温度", en_us="Temperature"),
             ),
             ParameterRule(
                 name="top_p",
                 type=ParameterType.FLOAT,
                 use_template="top_p",
-                label=I18nObject(zh_Hans="Top P", en_US="Top P"),
+                label=I18nObject(zh_hans="Top P", en_us="Top P"),
             ),
             ParameterRule(
                 name="max_tokens",
@@ -461,7 +518,7 @@ class SageMakerLargeLanguageModel(LargeLanguageModel):
                 min=1,
                 max=int(credentials.get("context_length", 2048)),
                 default=512,
-                label=I18nObject(zh_Hans="最大生成长度", en_US="Max Tokens"),
+                label=I18nObject(zh_hans="最大生成长度", en_us="Max Tokens"),
             ),
         ]
 
@@ -469,11 +526,11 @@ class SageMakerLargeLanguageModel(LargeLanguageModel):
 
         features = []
 
-        support_function_call = credentials.get("support_function_call", False)
-        if support_function_call:
+        function_calling_type = credentials.get("function_calling_type", False)
+        if function_calling_type == "tool_call":
             features.append(ModelFeature.TOOL_CALL)
 
-        support_vision = credentials.get("support_vision", False)
+        support_vision = credentials.get("vision_support", False)
         if support_vision:
             features.append(ModelFeature.VISION)
 
@@ -481,7 +538,7 @@ class SageMakerLargeLanguageModel(LargeLanguageModel):
 
         entity = AIModelEntity(
             model=model,
-            label=I18nObject(en_US=model),
+            label=I18nObject(en_us=model),
             fetch_from=FetchFrom.CUSTOMIZABLE_MODEL,
             model_type=ModelType.LLM,
             features=features,

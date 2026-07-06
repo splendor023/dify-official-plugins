@@ -1,0 +1,19 @@
+[project]
+name = "gmail_trigger"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+
+# Refresh the plugin lockfile with: uv lock
+dependencies = [
+    "dify_plugin>=0.9.1",
+    "google-auth>=2.55.1",
+    "google-cloud-pubsub>=2.39.0",
+    "requests>=2.34.2",
+    "werkzeug>=3.1.8",
+]
+
+# uv run black . -C -l 100 && uv run ruff check --fix
+[dependency-groups]
+dev = []

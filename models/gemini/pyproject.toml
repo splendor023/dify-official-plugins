@@ -5,18 +5,58 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 
-# uv pip compile pyproject.toml -o ./requirements.txt
+# Managed with uv; refresh the lockfile with `uv lock`.
 dependencies = [
-    "dify-plugin>=0.4.3,<0.5.0",
-    "google-genai>=1.27.0,<2.0.0",
-    "google-generativeai>=0.8.5",
-    "numpy>=2.3.2",
+    "dify-plugin>=0.9.0",
+    "google-genai>=2.5.0",
+    "numpy>=2.4.6",
+    "requests>=2.34.2",
 ]
 
-# uv run black . -C -l 100
-# uv run ruff check --fix
+# uv run black . && uv run ruff check --fix && uv run ruff format
 [dependency-groups]
 dev = [
-    "black>=25.1.0",
-    "ruff>=0.12.5",
+    "pytest>=9.0.3",
+    "ruff>=0.15.14",
+    "python-dotenv>=1.2.2",
+    "Pillow>=12.2.0",
+    "black>=26.5.1",
+    "pyyaml>=6.0.3",
 ]
+
+[tool.pytest.ini_options]
+# Pytest configuration for Gemini plugin tests
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+# Test discovery paths
+testpaths = ["models/tests/"]
+
+# Markers
+markers = [
+    "integration: marks tests as integration tests (requires API key)",
+    "unit: marks tests as unit tests (no API key required)"
+]
+
+# Logging configuration
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s [%(levelname)8s] %(name)s: %(message)s"
+log_cli_date_format = "%Y-%m-%d %H:%M:%S"
+
+# Warnings
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+    "ignore:Monkey-patching ssl after ssl has already been imported:gevent.monkey.MonkeyPatchWarning"
+]
+
+# Coverage options (if using pytest-cov)
+# addopts = ["--cov=models/llm", "--cov-report=term-missing", "--cov-report=html"]
+
+[tool.black]
+# Equivalent to: uv run black -C -l 100
+line-length = 100
+skip-string-normalization = true
+include = '(^|/)llm\.py$'

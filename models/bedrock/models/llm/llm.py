@@ -33,6 +33,7 @@ from dify_plugin.entities.model.llm import (
 from dify_plugin.entities.model.message import (
     AssistantPromptMessage,
     ImagePromptMessageContent,
+    DocumentPromptMessageContent,
     PromptMessage,
     PromptMessageContentType,
     PromptMessageTool,
@@ -54,6 +55,11 @@ from dify_plugin.errors.model import (
 from provider.get_bedrock_client import get_bedrock_client
 from .cache_config import is_cache_supported, get_cache_config
 from . import model_ids
+from utils.inference_profile import (
+    get_inference_profile_info,
+    validate_inference_profile,
+    extract_model_info_from_profile
+)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 logger = logging.getLogger(__name__)
@@ -66,12 +72,16 @@ if you are not sure about the structure.
 </instructions>
 """  # noqa: E501
 
-
 class BedrockLargeLanguageModel(LargeLanguageModel):
     # please refer to the documentation: https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html
     # TODO There is invoke issue: context limit on Cohere Model, will add them after fixed.
     CONVERSE_API_ENABLED_MODEL_INFO = [
+        {"prefix": "qwen.qwen3", "support_system_prompts": True, "support_tool_use": False},
+        {"prefix": "openai.gpt", "support_system_prompts": True, "support_tool_use": False},
+        {"prefix": "deepseek.v3-v1:0", "support_system_prompts": True, "support_tool_use": False},
+        {"prefix": "deepseek.v3.2", "support_system_prompts": True, "support_tool_use": True},
         {"prefix": "us.deepseek", "support_system_prompts": True, "support_tool_use": False},
+        {"prefix": "global.anthropic.claude", "support_system_prompts": True, "support_tool_use": True},
         {"prefix": "us.anthropic.claude", "support_system_prompts": True, "support_tool_use": True},
         {"prefix": "eu.anthropic.claude", "support_system_prompts": True, "support_tool_use": True},
         {"prefix": "apac.anthropic.claude", "support_system_prompts": True, "support_tool_use": True},
@@ -92,6 +102,17 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         {"prefix": "amazon.titan", "support_system_prompts": False, "support_tool_use": False},
         {"prefix": "ai21.jamba-1-5", "support_system_prompts": True, "support_tool_use": False},
     ]
+
+    # Models that require the bedrock-mantle endpoint with the OpenAI Responses API.
+    # These do NOT go through the standard Converse API path.
+    _BEDROCK_MANTLE_MODEL_IDS: frozenset = frozenset({
+        "openai.gpt-5.5",
+        "openai.gpt-5.4",
+    })
+
+    @staticmethod
+    def _is_bedrock_mantle_model(model_id: str) -> bool:
+        return model_id in BedrockLargeLanguageModel._BEDROCK_MANTLE_MODEL_IDS
 
     @staticmethod
     def _find_model_info(model_id):
@@ -115,7 +136,14 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         """
         Code block mode wrapper for invoking large language model
         """
-        if model_parameters.get("response_format"):
+        # When Dify's structured output is enabled, the Dify backend detects the "json_schema"
+        # parameter in the model YAML and passes the user-defined schema via model_parameters.
+        # We intercept it here and forward it to Bedrock's native outputConfig (Converse API),
+        # which uses constrained decoding to guarantee schema-compliant JSON output.
+        if model_parameters.get("json_schema"):
+            model_parameters.pop("response_format", None)
+            model_parameters["_structured_output_schema"] = model_parameters.pop("json_schema")
+        elif model_parameters.get("response_format"):
             stop = stop or []
             if "```\n" not in stop:
                 stop.append("```\n")
@@ -158,29 +186,94 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         :param user: unique user id
         :return: full response or stream response chunk generator result
         """
-        try:
+        # Check if this is an inference profile model
+        inference_profile_id = credentials.get("inference_profile_id")
+        if inference_profile_id:
+            # For inference profiles, we must use the converse API
+            try:
+                model_info = self._get_model_info(model, credentials, model_parameters)
+                if model_info:
+                    # Native Bedrock Structured Outputs: json_schema takes priority.
+                    # Same logic as _code_block_mode_wrapper — intercept the schema before
+                    # the legacy response_format handling runs.
+                    if model_parameters.get("json_schema"):
+                        model_parameters.pop("response_format", None)
+                        model_parameters["_structured_output_schema"] = model_parameters.pop("json_schema")
+                    # Handle response_format for inference profiles only if underlying model is Anthropic
+                    elif model_parameters.get("response_format"):
+                        # Check if the underlying model is Anthropic based
+                        profile_info = get_inference_profile_info(inference_profile_id, credentials)
+                        underlying_models = profile_info.get("models", [])
+                        is_anthropic = False
+
+                        if underlying_models:
+                            first_model_arn = underlying_models[0].get("modelArn", "")
+                            if "foundation-model/" in first_model_arn:
+                                underlying_model_id = first_model_arn.split("foundation-model/")[1]
+                                is_anthropic = "anthropic.claude" in underlying_model_id
+
+                        if is_anthropic:
+                            stop = stop or []
+                            if "```\n" not in stop:
+                                stop.append("```\n")
+                            if "\n```" not in stop:
+                                stop.append("\n```")
+                            response_format = model_parameters.pop("response_format")
+                            format_prompt = SystemPromptMessage(
+                                content=ANTHROPIC_BLOCK_MODE_PROMPT.replace("{{instructions}}", prompt_messages[0].content).replace(
+                                    "{{block}}", response_format
+                                )
+                            )
+                            if len(prompt_messages) > 0 and isinstance(prompt_messages[0], SystemPromptMessage):
+                                prompt_messages[0] = format_prompt
+                            else:
+                                prompt_messages.insert(0, format_prompt)
+                            prompt_messages.append(AssistantPromptMessage(content=f"\n```{response_format}"))
+                        else:
+                            # For non-Anthropic models, just remove response_format parameter
+                            model_parameters.pop("response_format", None)
+
+                    return self._generate_with_converse(
+                        model_info, credentials, prompt_messages, model_parameters, stop, stream, user, tools, model
+                    )
+                else:
+                    raise InvokeError(f"Could not get model information for inference profile {inference_profile_id}")
+            except Exception as e:
+                logger.error(f"Failed to invoke inference profile: {str(e)}")
+                raise InvokeError(f"Failed to invoke inference profile {inference_profile_id}: {str(e)}")
+        else:
+            # Check for bedrock-mantle models (GPT-5.5, GPT-5.4) before attempting Converse API.
+            # These models use a different endpoint and the OpenAI Responses API.
+            _model_name = model_parameters.get('model_name')
+            if _model_name:
+                _candidate_id = model_ids.get_model_id(model, _model_name)
+                if _candidate_id and self._is_bedrock_mantle_model(_candidate_id):
+                    return self._generate_with_responses_api(
+                        _candidate_id, credentials, prompt_messages, model_parameters, stop, stream, user
+                    )
+
+            # Traditional model - try converse API first, then fall back if needed
             model_info = self._get_model_info(model, credentials, model_parameters)
             if model_info:
                 return self._generate_with_converse(
                     model_info, credentials, prompt_messages, model_parameters, stop, stream, user, tools, model
                 )
-        except Exception as e:
-            logger.error(f"Failed to get model info: {str(e)}")
-            if credentials.get("inference_profile_id"):
-                raise InvokeError(f"Failed to invoke inference profile: {str(e)}")
 
-        # Fallback to traditional model ID for non-converse API models
-        model_name = model_parameters.get('model_name')
-        if not model_name:
-            raise InvokeError("Model name is required for non-converse API models")
+            # Fallback to traditional model ID for non-converse API models
+            model_name = model_parameters.get('model_name')
+            if not model_name:
+                raise InvokeError("Model name is required for non-converse API models")
 
         model_id = model_ids.get_model_id(model, model_name)
-        return self._generate(model_id, credentials, prompt_messages, model_parameters, stop, stream, user)
+        # Store model_name in credentials for pricing calculation
+        credentials_with_model = credentials.copy()
+        credentials_with_model['model_parameters'] = {'model_name': model_name}
+        return self._generate(model_id, credentials_with_model, prompt_messages, model_parameters, stop, stream, user)
 
     def _get_model_info(self, model: str, credentials: dict, model_parameters: dict) -> dict:
         """
         Get model information for converse API
-        
+
         :param model: model name
         :param credentials: model credentials
         :param model_parameters: model parameters
@@ -189,7 +282,7 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         inference_profile_id = credentials.get("inference_profile_id")
         if inference_profile_id:
             # Get the full ARN from the profile ID
-            profile_info = self._get_inference_profile_info_direct(inference_profile_id, credentials)
+            profile_info = get_inference_profile_info(inference_profile_id, credentials)
             profile_arn = profile_info.get("inferenceProfileArn")
 
             if not profile_arn:
@@ -197,7 +290,6 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
 
             # Use inference profile ARN as model ID
             model_id = profile_arn
-            logger.info(f"Using inference profile ARN: {model_id}")
 
             # Determine model capabilities from underlying models
             underlying_models = profile_info.get("models", [])
@@ -213,10 +305,9 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
                         # Use the inference profile ARN but with underlying model capabilities
                         model_info = model_info.copy()
                         model_info["model"] = model_id  # Use inference profile ARN for actual API call
-                        logger.info(f"Using inference profile {model_id} with capabilities from {underlying_model_id}")
+                        model_info["underlying_model_id"] = underlying_model_id  # Store underlying model ID for cache support
                         return model_info
             if not model_info:
-                logger.info(f"Using inference profile {model_id} with default capabilities")
                 return {
                     "model": model_id,
                     "support_system_prompts": True,
@@ -224,20 +315,38 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
                 }
         else:
             # Use traditional model ID resolution
-            model_name = model_parameters.pop('model_name')
+            model_name = model_parameters.get('model_name')
             model_id = model_ids.get_model_id(model, model_name)
-            if model_parameters.pop('cross-region', False):
-                region_name = credentials['aws_region']
-                region_prefix = model_ids.get_region_area(region_name)
+
+            # Store model_name in credentials for pricing calculation
+            if 'model_parameters' not in credentials:
+                credentials['model_parameters'] = {}
+            credentials['model_parameters']['model_name'] = model_name
+
+            # Get region prefix for model ID construction
+            region_name = credentials['aws_region']
+            region_prefix = None
+            cross_region = model_parameters.pop('cross-region', 'disabled')
+
+            if cross_region in ('geographic', 'global'):
+                # Cross-region inference enabled
+                prefer_global = (cross_region == 'global')
+                region_prefix = model_ids.get_region_area(region_name, prefer_global=prefer_global)
+
                 if not region_prefix:
-                    raise InvokeError(f'Region {region_name} Unsupport cross-region Inference')
+                    raise InvokeError(f'Failed to get cross-region inference prefix for region {region_name}')
+
+                if not model_ids.is_support_cross_region(model_id):
+                    raise InvokeError(f"Model {model_id} doesn't support cross-region inference")
+
                 model_id = "{}.{}".format(region_prefix, model_id)
+
 
             model_info = BedrockLargeLanguageModel._find_model_info(model_id)
             if model_info:
                 model_info["model"] = model_id
                 return model_info
-            
+
             return None
 
     def _generate_with_converse(
@@ -266,25 +375,31 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         bedrock_client = get_bedrock_client("bedrock-runtime", credentials)
 
         # Get cache checkpoint settings from model parameters
-        system_cache_checkpoint = model_parameters.pop("system_cache_checkpoint", True)
+        # Log the incoming parameters for debugging
+        # The default for 'system_cache_checkpoint' is now set to False (was previously True).
+        # This change ensures that cache checkpoints are only enabled if explicitly set by the user in the UI.
+        # This prevents unintended caching behavior and aligns with updated UI settings where the default is unchecked.
+        system_cache_checkpoint = model_parameters.pop("system_cache_checkpoint", False)
         latest_two_messages_cache_checkpoint = model_parameters.pop("latest_two_messages_cache_checkpoint", False)
         logger.info(f"---cache_checkpoints--- system: {system_cache_checkpoint}, penultimate: {latest_two_messages_cache_checkpoint}")
         model_id = model_info["model"]
-        print(f"[CACHE DEBUG] Model: {model_id}, Cache checkpoints - System: {system_cache_checkpoint}, Penultimate: {latest_two_messages_cache_checkpoint}")
-        logger.info(f"[CACHE DEBUG] Model: {model_id}, Cache checkpoints - System: {system_cache_checkpoint}, Penultimate: {latest_two_messages_cache_checkpoint}")
+        logger.debug(f"Model: {model_id}, Cache checkpoints - System: {system_cache_checkpoint}, Penultimate: {latest_two_messages_cache_checkpoint}")
 
         # Enable cache if either checkpoint is enabled
-        cache_supported = is_cache_supported(model_id)
-        print(f"[CACHE DEBUG] Model: {model_id}, Cache supported: {cache_supported}")
-        logger.info(f"[CACHE DEBUG] Model: {model_id}, Cache supported: {cache_supported}")
+        # For inference profiles, use underlying model ID for cache support check
+        cache_check_model_id = model_info.get("underlying_model_id", model_id)
+        cache_supported = is_cache_supported(cache_check_model_id)
+        logger.debug(f"Model: {model_id}, Underlying: {cache_check_model_id}, Cache supported: {cache_supported}")
         if cache_supported == False:
             system_cache_checkpoint = False
             latest_two_messages_cache_checkpoint = False
 
         # Convert messages with cache points if enabled
+        # For inference profiles, use underlying model ID for cache configuration
+        cache_config_model_id = model_info.get("underlying_model_id", model_id)
         system, prompt_message_dicts = self._convert_converse_prompt_messages(
             prompt_messages,
-            model_id=model_id,
+            model_id=cache_config_model_id,
             system_cache_checkpoint=system_cache_checkpoint,
             latest_two_messages_cache_checkpoint=latest_two_messages_cache_checkpoint
         )
@@ -297,11 +412,71 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
             "additionalModelRequestFields": additional_model_fields,
         }
 
+        # Bedrock native Structured Outputs via Converse API outputConfig.
+        # When a user-defined JSON schema is provided (from Dify's structured output UI),
+        # we inject it into the Converse API's outputConfig.textFormat parameter.
+        # Bedrock uses constrained decoding to guarantee the response conforms to the schema.
+        # Requires boto3 >= 1.42.42.
+        # See: https://docs.aws.amazon.com/bedrock/latest/userguide/structured-output.html
+        structured_schema = model_parameters.pop("_structured_output_schema", None)
+        if structured_schema:
+            if isinstance(structured_schema, str):
+                schema_dict = json.loads(structured_schema)
+            else:
+                schema_dict = structured_schema
+            # Dify wraps the user schema as {"schema": {...}, "name": "llm_response"}
+            parameters["outputConfig"] = {
+                "textFormat": {
+                    "type": "json_schema",
+                    "structure": {
+                        "jsonSchema": {
+                            "schema": json.dumps(schema_dict.get("schema", schema_dict)),
+                            "name": schema_dict.get("name", "response"),
+                        }
+                    }
+                }
+            }
+
         if model_info["support_system_prompts"] and system and len(system) > 0:
             parameters["system"] = system
 
-        if model_info["support_tool_use"] and tools:
-            parameters["toolConfig"] = self._convert_converse_tool_config(tools=tools)
+        # Check if message history contains tool-related content
+        # AWS Bedrock requires toolConfig when messages contain toolUse or toolResult blocks
+        has_tool_content_in_messages = False
+        if model_info["support_tool_use"]:
+            for msg in prompt_messages:
+                if isinstance(msg, AssistantPromptMessage) and msg.tool_calls:
+                    has_tool_content_in_messages = True
+                    break
+                if isinstance(msg, ToolPromptMessage):
+                    has_tool_content_in_messages = True
+                    break
+
+        # Add toolConfig based on tools and message history
+        if model_info["support_tool_use"]:
+            if tools:
+                # Normal case: tools provided
+                parameters["toolConfig"] = self._convert_converse_tool_config(tools=tools)
+            elif has_tool_content_in_messages:
+                # WORKAROUND for Dify Agent issue:
+                # In the last iteration, Dify sets tools=[] but messages contain tool history
+                # AWS Bedrock requires toolConfig.tools to have at least 1 element
+                # Create a placeholder tool that LLM won't call, allowing agent to finish gracefully
+                logger.info(
+                    "Message history contains tool calls but no tools provided. "
+                    "Creating placeholder tool to satisfy AWS Bedrock API requirements. "
+                    "This prevents the agent from making further tool calls."
+                )
+                placeholder_tool = PromptMessageTool(
+                    name="__no_more_tools_available__",
+                    description="This is a placeholder tool. No more tools are available for this conversation. Please provide a final answer based on the information already gathered.",
+                    parameters={
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                )
+                parameters["toolConfig"] = self._convert_converse_tool_config(tools=[placeholder_tool])
         try:
             # for issue #10976
             conversations_list = parameters["messages"]
@@ -330,25 +505,21 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
                     cache_write_tokens = response["usage"].get("cacheWriteInputTokens", 0)
 
                     # Always log the metrics for debugging
-                    print(f"[CACHE METRICS] Model: {model_id}, Read: {cache_read_tokens} tokens, Write: {cache_write_tokens} tokens")
                     logger.info(f"[CACHE METRICS] Model: {model_id}, Read: {cache_read_tokens} tokens, Write: {cache_write_tokens} tokens")
 
                     # Print the full response usage for debugging
-                    print(f"[CACHE DEBUG] Response usage: {json.dumps(response['usage'], default=str)}")
 
                     # Log cache usage if any tokens were read or written
                     if cache_read_tokens > 0 or cache_write_tokens > 0:
                         logger.info(f"Cache metrics - Model: {model_id}, Read: {cache_read_tokens} tokens, Write: {cache_write_tokens} tokens")
                         # If tokens were read from cache, log the savings
                         if cache_read_tokens > 0:
-                            print(f"[CACHE HIT] {cache_read_tokens} tokens read from cache")
-                            logger.info(f"Cache hit detected - {cache_read_tokens} tokens read from cache")
+                            logger.debug(f"[CACHE HIT] {cache_read_tokens} tokens read from cache")
                         elif cache_write_tokens > 0:
-                            print(f"[CACHE WRITE] {cache_write_tokens} tokens written to cache")
-                            logger.info(f"Cache write detected - {cache_write_tokens} tokens written to cache")
+                            logger.debug(f"[CACHE WRITE] {cache_write_tokens} tokens written to cache")
                 else:
                     # Log if usage data is missing
-                    print(f"[WARNING] No usage data in response")
+                    logger.warning(f"[WARNING] No usage data in response")
                     logger.warning(f"No usage data in response")
 
                 return self._handle_converse_response(model_info["model"], credentials, response, prompt_messages)
@@ -488,26 +659,21 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
                         cache_write_tokens = chunk["metadata"]["usage"].get("cacheWriteInputTokens", 0)
 
                         # Always log the metrics for debugging
-                        print(f"[STREAM CACHE METRICS] Model: {model}, Read: {cache_read_tokens} tokens, Write: {cache_write_tokens} tokens")
                         logger.info(f"[STREAM CACHE METRICS] Model: {model}, Read: {cache_read_tokens} tokens, Write: {cache_write_tokens} tokens")
 
                         # Print the full usage data for debugging
-                        print(f"[STREAM USAGE DATA] {json.dumps(chunk['metadata']['usage'], default=str)}")
 
                         # Log cache usage if any tokens were read or written
                         if cache_read_tokens > 0 or cache_write_tokens > 0:
                             logger.info(f"Cache metrics - Model: {model}, Read: {cache_read_tokens} tokens, Write: {cache_write_tokens} tokens")
                             # If tokens were read from cache, log the savings
                             if cache_read_tokens > 0:
-                                print(f"[STREAM CACHE HIT] {cache_read_tokens} tokens read from cache")
-                                logger.info(f"Cache hit detected - {cache_read_tokens} tokens read from cache")
+                                logger.debug(f"[STREAM CACHE HIT] {cache_read_tokens} tokens read from cache")
                             elif cache_write_tokens > 0:
-                                print(f"[STREAM CACHE WRITE] {cache_write_tokens} tokens written to cache")
-                                logger.info(f"Cache write detected - {cache_write_tokens} tokens written to cache")
+                                logger.debug(f"[STREAM CACHE WRITE] {cache_write_tokens} tokens written to cache")
                     else:
                         # Log if usage data is missing
-                        print(f"[STREAM WARNING] No usage data in metadata: {json.dumps(chunk['metadata'], default=str)}")
-                        logger.warning(f"No usage data in metadata chunk: {json.dumps(chunk['metadata'], default=str)}")
+                        logger.warning(f"[STREAM WARNING] No usage data found in metadata chunk")
 
                     usage = self._calc_response_usage(model, credentials, input_tokens, output_tokens)
                     yield LLMResultChunk(
@@ -611,18 +777,23 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         additional_model_fields = {}
         if "max_tokens" in model_parameters:
             inference_config["maxTokens"] = model_parameters["max_tokens"]
+        elif "max_new_tokens" in model_parameters:
+            inference_config["maxTokens"] = model_parameters["max_new_tokens"]
 
         if "temperature" in model_parameters:
             inference_config["temperature"] = model_parameters["temperature"]
 
         if "top_p" in model_parameters:
-            inference_config["topP"] = model_parameters["temperature"]
+            inference_config["topP"] = model_parameters["top_p"]
 
         if stop:
             inference_config["stopSequences"] = stop
 
         if "top_k" in model_parameters:
             additional_model_fields["top_k"] = model_parameters["top_k"]
+
+        if "anthropic_beta" in model_parameters:
+            additional_model_fields["anthropic_beta"] = list(map(lambda v:v.strip(), model_parameters["anthropic_beta"].strip().split(",")))
 
         # process reasoning related parameters, construct nested reasoning_config structure
         if "reasoning_type" in model_parameters:
@@ -677,7 +848,7 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         # and system_cache_checkpoint is enabled
         if system and cache_config and "system" in cache_config["supported_fields"] and system_cache_checkpoint:
             system.append({"cachePoint": {"type": "default"}})
-            print(f"[CACHE DEBUG] Added cache point to system messages for model: {model_id}")
+            logger.debug(f"Added cache point to system messages for model: {model_id}")
 
             # Process other messages
         for message in other_messages:
@@ -693,26 +864,23 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
             if len(user_message_indices) > 0:
                 # Get indices for the latest messages (either one or two depending on availability)
                 indices_to_cache = user_message_indices[-min(2, len(user_message_indices)):]
-                print(f"[CACHE DEBUG] indices_to_cacheis {indices_to_cache}")
+                logger.debug(f"indices_to_cache is {indices_to_cache}")
                 for idx in indices_to_cache:
                     message = prompt_message_dicts[idx]
-                    print(f"[CACHE DEBUG] current idx is {idx}")
+                    logger.debug(f"current idx is {idx}")
 
                     # Check if content is a list
                     if isinstance(message["content"], list):
                         # Add cache point to the content array
                         message["content"].append({"cachePoint": {"type": "default"}})
-                        print(f"[CACHE DEBUG] Added cache point to user message content list at index {idx} for model: {model_id}")
+                        logger.debug(f"Added cache point to user message content list at index {idx} for model: {model_id}")
                     else:
                         # If content is not a list, convert it to a list with the original content and add cache point
                         original_content = message["content"]
                         message["content"] = [{"text": original_content}, {"cachePoint": {"type": "default"}}]
-                        print(f"[CACHE DEBUG] Converted user message content to list and added cache point at index {idx} for model: {model_id}")
+                        logger.debug(f"Converted user message content to list and added cache point at index {idx} for model: {model_id}")
 
                     prompt_message_dicts[idx] = message
-        # Print the final system and messages for debugging
-        # print(f"[CACHE DEBUG] System messages: {json.dumps(system, default=str)}")
-        print(f"[CACHE DEBUG] Prompt messages: {json.dumps(prompt_message_dicts, default=str)}")
 
         return system, prompt_message_dicts
 
@@ -743,7 +911,7 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
                 message_dict = {"role": "user", "content": [{"text": message.content}]}
             else:
                 sub_messages = []
-                for message_content in message.content:
+                for idx, message_content in enumerate(message.content):
                     if message_content.type == PromptMessageContentType.TEXT:
                         message_content = cast(TextPromptMessageContent, message_content)
                         sub_message_dict = {"text": message_content.data}
@@ -763,6 +931,22 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
 
                         sub_message_dict = {
                             "image": {"format": mime_type.replace("image/", ""), "source": {"bytes": image_content}}
+                        }
+                        sub_messages.append(sub_message_dict)
+                    elif message_content.type == PromptMessageContentType.DOCUMENT:
+                        message_content = cast(DocumentPromptMessageContent, message_content)
+                        doc_bytes = base64.b64decode(message_content.base64_data)
+                        mime_type = message_content.mime_type
+
+                        SUPPORTED_DOC_MIME_TYPES = ["application/pdf"]
+                        if mime_type not in SUPPORTED_DOC_MIME_TYPES:
+                            raise ValueError(
+                                f"Unsupported document type {mime_type}, "
+                                f"only support application/pdf"
+                            )
+
+                        sub_message_dict = {
+                            "document": {"format": mime_type.replace("application/", ""), "name": f"pdf-{idx}", "source": {"bytes": doc_bytes}}
                         }
                         sub_messages.append(sub_message_dict)
 
@@ -821,12 +1005,18 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         :param tools: tools for tool calling
         :return:md = genai.GenerativeModel(model)
         """
+        model_parts = model.split(".")
+
+        prefix = ""
+        model_name = ""
         if model.startswith('us.') or model.startswith('eu.'):
-            prefix = model.split(".")[1]
-            model_name = model.split(".")[2]
+            if len(model_parts) >= 3:
+                prefix = model_parts[1]
+                model_name = model_parts[2]
         else:
-            prefix = model.split(".")[0]
-            model_name = model.split(".")[1]
+            if len(model_parts) >= 2:
+                prefix = model_parts[0]
+                model_name = model_parts[1]
 
         if isinstance(prompt_messages, str):
             prompt = prompt_messages
@@ -838,7 +1028,7 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
     def get_customizable_model_schema(self, model: str, credentials: dict) -> Optional[AIModelEntity]:
         """
         Get customizable model schema for inference profiles
-        
+
         :param model: model name
         :param credentials: model credentials
         :return: AIModelEntity
@@ -847,92 +1037,107 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         if inference_profile_id:
             try:
                 # Get inference profile info from AWS directly
-                profile_info = self._get_inference_profile_info_direct(inference_profile_id, credentials)
-                
+                profile_info = get_inference_profile_info(inference_profile_id, credentials)
+
                 # Extract model name from profile
                 profile_name = profile_info.get("inferenceProfileName", model)
                 context_length = int(credentials.get("context_length", 4096))
-                
+
                 # Find matching predefined model based on underlying model ARN
                 default_pricing = None
                 matched_features = []
+                matched_parameter_rules = []
+                matched_model_properties = {
+                    "mode": LLMMode.CHAT,
+                    "context_size": context_length,
+                }
                 underlying_models = profile_info.get("models", [])
+
                 if underlying_models:
                     first_model_arn = underlying_models[0].get("modelArn", "")
                     if "foundation-model/" in first_model_arn:
                         underlying_model_id = first_model_arn.split("foundation-model/")[1]
                         model_schemas = self.predefined_models()
+
+                        # Try to get model-specific pricing based on the underlying model ID
+                        # Map model ID to model name for pricing lookup
+                        model_name_for_pricing = self._map_model_id_to_name(underlying_model_id)
+
+                        # First try to find individual model schema for pricing
+                        if model_name_for_pricing:
+                            individual_pricing = self._get_model_specific_pricing("", model_name_for_pricing, model_schemas)
+                            if individual_pricing:
+                                default_pricing = individual_pricing
+
+                        # Then find matching schema for features and parameters
                         for model_schema in model_schemas:
                             if self._model_id_matches_schema(underlying_model_id, model_schema):
-                                default_pricing = model_schema.pricing
+                                # Use individual pricing if found, otherwise fall back to schema pricing
+                                if not default_pricing:
+                                    default_pricing = model_schema.pricing
+
                                 matched_features = model_schema.features or []
+                                # Extract allowed parameters from model schema, excluding model_name since it's determined by inference profile
+                                matched_parameter_rules = self._get_inference_profile_parameter_rules(model_schema, underlying_model_id)
+                                if model_schema.model_properties:
+                                    matched_model_properties.update(model_schema.model_properties)
+                                    # Override context_size with user-specified value
+                                    matched_model_properties["context_size"] = context_length
                                 break
-                
+
                 # Fallback to first predefined model pricing if no match found
                 if not default_pricing:
                     model_schemas = self.predefined_models()
                     if model_schemas:
                         default_pricing = model_schemas[0].pricing
-                
+
+                # Use the user-provided model name exactly as entered
                 # Create custom model entity based on inference profile
                 return AIModelEntity(
                     model=model,
-                    label=I18nObject(en_US=model),
+                    label=I18nObject(en_us=model),
                     model_type=ModelType.LLM,
                     features=matched_features,
                     fetch_from=FetchFrom.CUSTOMIZABLE_MODEL,
-                    model_properties={
-                        "mode": LLMMode.CHAT,
-                        "context_size": context_length,
-                    },
-                    parameter_rules=[],
+                    model_properties=matched_model_properties,
+                    parameter_rules=matched_parameter_rules,
                     pricing=default_pricing
                 )
             except Exception as e:
                 logger.error(f"Failed to get inference profile schema: {str(e)}")
-                # Create fallback custom model entity with user's model name
+                # Create fallback custom model entity with inference profile name
                 context_length = int(credentials.get("context_length", 4096))
                 model_schemas = self.predefined_models()
                 default_pricing = model_schemas[0].pricing if model_schemas else None
-                
+                # For fallback, extract parameters from first model schema
+                fallback_parameter_rules = []
+                if model_schemas:
+                    # For fallback, we don't have underlying_model_id, so pass None to get all params except model_name
+                    fallback_parameter_rules = self._get_inference_profile_parameter_rules(model_schemas[0], None)
+                fallback_features = model_schemas[0].features if model_schemas else []
+                fallback_model_properties = {
+                    "mode": LLMMode.CHAT,
+                    "context_size": context_length,
+                }
+                # Use first model's properties as fallback, but keep user-specified context_size
+                if model_schemas and model_schemas[0].model_properties:
+                    fallback_model_properties.update(model_schemas[0].model_properties)
+                    fallback_model_properties["context_size"] = context_length
+
                 return AIModelEntity(
                     model=model,
-                    label=I18nObject(en_US=model),
+                    label=I18nObject(en_us=model),
                     model_type=ModelType.LLM,
-                    features=[],
+                    features=fallback_features,
                     fetch_from=FetchFrom.CUSTOMIZABLE_MODEL,
-                    model_properties={
-                        "mode": LLMMode.CHAT,
-                        "context_size": context_length,
-                    },
-                    parameter_rules=[],
+                    model_properties=fallback_model_properties,
+                    parameter_rules=fallback_parameter_rules,
                     pricing=default_pricing
                 )
-        
+
         # This should not be reached for inference profile models, but keep as final fallback
         return None
 
-    def _get_inference_profile_info_direct(self, inference_profile_id: str, credentials: dict) -> dict:
-        """
-        Get inference profile information from Bedrock API directly
-        
-        :param inference_profile_id: inference profile identifier
-        :param credentials: credentials containing AWS access info
-        :return: inference profile information
-        """
-        try:
-            bedrock_client = get_bedrock_client("bedrock", credentials)
-            
-            # Call get-inference-profile API
-            response = bedrock_client.get_inference_profile(
-                inferenceProfileIdentifier=inference_profile_id
-            )
-            
-            return response
-            
-        except Exception as e:
-            logger.error(f"Failed to get inference profile info: {str(e)}")
-            raise e
 
     def validate_credentials(self, model: str, credentials: dict) -> None:
         """
@@ -942,57 +1147,27 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         :param credentials: model credentials
         :return:
         """
+        if 'auth_method' not in credentials:
+            raise CredentialsValidateFailedError("Authentication method 'auth_method' is missing in credentials.")
+
+        inference_profile_id = credentials.get("inference_profile_id")
+        if inference_profile_id:
+            validate_inference_profile(inference_profile_id, credentials)
+            logger.info(f"Successfully validated inference profile: {inference_profile_id}")
+
         try:
-            # Check if this is an inference profile based custom model
-            inference_profile_id = credentials.get("inference_profile_id")
-            if inference_profile_id:
-                # Validate inference profile directly
-                self._validate_inference_profile_direct(inference_profile_id, credentials)
-                logger.info(f"Successfully validated inference profile: {inference_profile_id}")
+            if credentials['auth_method'] == 'IAM_Role':
                 return
-            
-            # Traditional model validation
-            foundation_model_ids = self._list_foundation_models(credentials=credentials)
-            cris_prefix = model_ids.get_region_area(credentials.get("aws_region"))
-            if model.startswith(cris_prefix):
-                model = model.split('.', 1)[1]
-            logger.info(f"get model_ids: {foundation_model_ids}")
-            if model not in foundation_model_ids:
-                raise ValueError(f"model id: {model} not found in bedrock")
+            elif credentials['auth_method'] == 'Access_Secret_Key':
+                if credentials['aws_access_key_id'] and credentials['aws_secret_access_key']:
+                    return
+            elif credentials['auth_method'] == 'API_Key':
+                if credentials['bedrock_api_key']:
+                    return
+
+            raise CredentialsValidateFailedError(f"Invalid or incomplete credentials for auth_method: {credentials.get('auth_method')}")
         except Exception as ex:
             raise CredentialsValidateFailedError(str(ex))
-
-    def _validate_inference_profile_direct(self, inference_profile_id: str, credentials: dict) -> None:
-        """
-        Validate inference profile by calling Bedrock API directly
-        
-        :param inference_profile_id: inference profile identifier
-        :param credentials: credentials containing AWS access info
-        """
-        try:
-            bedrock_client = get_bedrock_client("bedrock", credentials)
-            
-            # Call get-inference-profile API
-            response = bedrock_client.get_inference_profile(
-                inferenceProfileIdentifier=inference_profile_id
-            )
-            
-            # Check if profile is active
-            if response.get('status') != 'ACTIVE':
-                raise CredentialsValidateFailedError(f"Inference profile {inference_profile_id} is not active")
-                
-            logger.info(f"Successfully validated inference profile: {inference_profile_id}")
-            
-        except ClientError as e:
-            error_code = e.response['Error']['Code']
-            if error_code == 'ResourceNotFoundException':
-                raise CredentialsValidateFailedError(f"Inference profile {inference_profile_id} not found")
-            elif error_code == 'AccessDeniedException':
-                raise CredentialsValidateFailedError(f"Access denied to inference profile {inference_profile_id}")
-            else:
-                raise CredentialsValidateFailedError(f"Failed to validate inference profile: {str(e)}")
-        except Exception as e:
-            raise CredentialsValidateFailedError(f"Failed to validate inference profile: {str(e)}")
 
     def _list_foundation_models(self, credentials: dict) -> list[str]:
         """
@@ -1350,19 +1525,57 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
 
         return InvokeError(error_msg)
 
+    def _get_inference_profile_parameter_rules(self, model_schema, underlying_model_id: str = None) -> list:
+        """
+        Extract allowed parameter rules from model schema for inference profiles
+
+        :param model_schema: The predefined model schema
+        :param underlying_model_id: The underlying model ID (for model-specific filtering)
+        :return: List of parameter rules suitable for inference profiles
+        """
+        if not model_schema.parameter_rules:
+            return []
+
+        # Always exclude model_name since it's determined by inference profile
+        excluded_params = ['model_name']
+
+        # Apply model-specific filtering if underlying_model_id is available
+        allowed_parameter_rules = []
+        for rule in model_schema.parameter_rules:
+            if rule.name in excluded_params:
+                continue
+
+            # For Anthropic models, include response_format only if it's an Anthropic model
+            if rule.name == 'response_format':
+                if underlying_model_id and "anthropic.claude" not in underlying_model_id:
+                    continue  # Skip response_format for non-Anthropic models
+                elif not underlying_model_id:
+                    # Fallback case: only include if this is an Anthropic schema
+                    if not (hasattr(model_schema, 'model') and model_schema.model == "anthropic claude"):
+                        continue
+
+            allowed_parameter_rules.append(rule)
+
+        return allowed_parameter_rules
+
     def _model_id_matches_schema(self, model_id: str, model_schema) -> bool:
         """
         Check if a model ID matches a predefined model schema
-        
+
         :param model_id: The model ID from inference profile (e.g., anthropic.claude-3-5-sonnet-20241022-v2:0)
         :param model_schema: The predefined model schema
         :return: True if the model ID matches the schema
         """
-        # Extract the model family from the model ID
+        # Extract the model family from the model ID and check individual models first
         if "anthropic.claude" in model_id:
-            return model_schema.model == "anthropic claude"
+            return (model_schema.model == "anthropic claude" or
+                   model_schema.model.startswith("claude-"))
         elif "amazon.nova" in model_id:
-            return model_schema.model == "amazon nova"
+            return (model_schema.model == "amazon nova" or
+                   model_schema.model.startswith("nova-"))
+        elif "cohere.command" in model_id:
+            return (model_schema.model == "cohere" or
+                   model_schema.model.startswith("cohere-"))
         elif "ai21" in model_id:
             return model_schema.model == "ai21"
         elif "meta.llama" in model_id:
@@ -1371,5 +1584,411 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
             return model_schema.model == "mistral"
         elif "deepseek" in model_id:
             return model_schema.model == "deepseek"
-        
+
         return False
+
+    def _map_model_id_to_name(self, model_id: str) -> Optional[str]:
+        """
+        Map a Bedrock model ID to a model name for pricing lookup.
+
+        :param model_id: The Bedrock model ID (e.g., 'anthropic.claude-3-5-sonnet-20241022-v2:0')
+        :return: The model name or None
+        """
+        # Reverse lookup from model_ids
+        from . import model_ids
+
+        # Remove version suffix if present
+        base_model_id = model_id.split(':')[0] if ':' in model_id else model_id
+
+        # Search through all model families
+        for family, models in model_ids.BEDROCK_MODEL_IDS.items():
+            for name, id_value in models.items():
+                # Compare base IDs without version
+                base_id_value = id_value.split(':')[0] if ':' in id_value else id_value
+                if base_id_value == base_model_id or id_value == model_id:
+                    return name
+
+        return None
+
+    def _get_model_specific_pricing(self, model: str, model_name: str, model_schemas: list):
+        """
+        Get model-specific pricing based on model name.
+        First tries to find exact model match from model_configurations directory, then falls back to family pricing.
+
+        :param model: The model family (e.g., 'anthropic-claude')
+        :param model_name: The specific model name (e.g., 'Claude 3.5 Sonnet')
+        :param model_schemas: List of predefined model schemas
+        :return: Pricing configuration or None
+        """
+        # Create model name mapping for individual model files
+        model_name_mapping = {
+            # OpenAI GPT-5.x models (bedrock-mantle endpoint)
+            'GPT-5.5': 'gpt-5-5',
+            'GPT-5.4': 'gpt-5-4',
+            # Claude models
+            'Claude 4.8 Opus': 'claude-4-8-opus',
+            'Claude 4.7 Opus': 'claude-4-7-opus',
+            'Claude 4.0 Sonnet': 'claude-4-sonnet',
+            'Claude 4.0 Opus': 'claude-4-opus',
+            'Claude 3.7 Sonnet': 'claude-3-7-sonnet',
+            'Claude 3.5 Haiku': 'claude-3-5-haiku',
+            'Claude 3.5 Sonnet': 'claude-3-5-sonnet',
+            'Claude 3.5 Sonnet V2': 'claude-3-5-sonnet',
+            'Claude 3 Haiku': 'claude-3-haiku',
+            'Claude 3 Sonnet': 'claude-3-sonnet',
+            'Claude 3 Opus': 'claude-3-opus',
+            # Nova models
+            'Nova Micro': 'nova-micro',
+            'Nova Lite': 'nova-lite',
+            'Nova Pro': 'nova-pro',
+            # Cohere models
+            'Command': 'cohere-command',
+            'Command Light': 'cohere-command-light',
+            'Command R': 'cohere-command-r',
+            'Command R+': 'cohere-command-rplus'
+        }
+
+        # First, try to load individual model pricing from model_configurations subdirectory
+        individual_model_name = model_name_mapping.get(model_name)
+        if individual_model_name:
+            try:
+                import os
+                import yaml
+                # Get the directory of this file
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                individual_model_path = os.path.join(current_dir, 'model_configurations', f'{individual_model_name}.yaml')
+
+                if os.path.exists(individual_model_path):
+                    with open(individual_model_path, 'r', encoding='utf-8') as f:
+                        model_config = yaml.safe_load(f)
+                        if 'pricing' in model_config:
+                            return model_config['pricing']
+            except Exception as e:
+                # If individual model file loading fails, continue to fallback
+                pass
+
+        # Fallback: try to find individual model in existing schemas (for backward compatibility)
+        if individual_model_name:
+            for schema in model_schemas:
+                if schema.model == individual_model_name:
+                    return schema.pricing
+
+        # If no model family provided, skip family pricing lookup
+        if not model:
+            return None
+
+        # If no individual model found, try family pricing
+        # Look for exact model match first
+        for schema in model_schemas:
+            if schema.model == model:
+                return schema.pricing
+
+        # If exact match not found, try with different formats
+        # Sometimes model might be passed as 'anthropic claude' vs 'anthropic-claude'
+        model_variants = [
+            model.replace('-', ' '),  # 'anthropic-claude' -> 'anthropic claude'
+            model.replace(' ', '-'),  # 'anthropic claude' -> 'anthropic-claude'
+            model.lower(),
+            model.lower().replace('-', ' '),
+            model.lower().replace(' ', '-')
+        ]
+
+        for schema in model_schemas:
+            for variant in model_variants:
+                if schema.model == variant:
+                    return schema.pricing
+
+        return None
+
+    def _calc_response_usage(self, model: str, credentials: dict, prompt_tokens: int, completion_tokens: int):
+        """
+        Calculate response usage with per-model pricing support.
+
+        :param model: model name
+        :param credentials: model credentials
+        :param prompt_tokens: number of prompt tokens
+        :param completion_tokens: number of completion tokens
+        :return: LLMUsage
+        """
+        # Get model-specific pricing if available
+        model_parameters = credentials.get('model_parameters', {})
+        model_name = model_parameters.get('model_name')
+
+        if model_name:
+            # Try to get model-specific pricing
+            model_schemas = self.predefined_models()
+            model_pricing = self._get_model_specific_pricing(model, model_name, model_schemas)
+
+            if model_pricing:
+                # Use model-specific pricing
+                from dify_plugin.entities.model.llm import LLMUsage
+
+                # Handle both dict and object pricing formats
+                if isinstance(model_pricing, dict):
+                    input_price = float(model_pricing['input'])
+                    output_price = float(model_pricing['output'])
+                    unit_price = float(model_pricing['unit'])
+                    currency = model_pricing.get('currency', 'USD')
+                else:
+                    # Object with attributes
+                    input_price = float(model_pricing.input)
+                    output_price = float(model_pricing.output)
+                    unit_price = float(model_pricing.unit)
+                    currency = model_pricing.currency
+
+                # Calculate costs correctly: (tokens × price) ÷ unit_tokens
+                input_cost = (prompt_tokens * input_price) / (1.0 / unit_price)
+                output_cost = (completion_tokens * output_price) / (1.0 / unit_price)
+
+                # Round to avoid floating point precision issues
+                input_cost = round(input_cost, 8)
+                output_cost = round(output_cost, 8)
+                total_cost = round(input_cost + output_cost, 8)
+
+                # Get latency from parent class by calling it first
+                parent_usage = super()._calc_response_usage(model, credentials, prompt_tokens, completion_tokens)
+
+                return LLMUsage(
+                    prompt_tokens=prompt_tokens,
+                    prompt_unit_price=input_price,
+                    prompt_price_unit=unit_price,
+                    prompt_price=input_cost,
+                    completion_tokens=completion_tokens,
+                    completion_unit_price=output_price,
+                    completion_price_unit=unit_price,
+                    completion_price=output_cost,
+                    total_tokens=prompt_tokens + completion_tokens,
+                    total_price=total_cost,
+                    currency=currency,
+                    latency=parent_usage.latency,  # Use parent's latency calculation
+                )
+
+        # Fallback to parent class implementation
+        return super()._calc_response_usage(model, credentials, prompt_tokens, completion_tokens)
+
+    # -------------------------------------------------------------------------
+    # bedrock-mantle / OpenAI Responses API path (GPT-5.5, GPT-5.4)
+    # https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-55.html
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _map_openai_exception(ex: Exception) -> None:
+        """Map openai SDK exceptions to the corresponding Dify invoke error types."""
+        try:
+            import openai
+            if isinstance(ex, openai.APIConnectionError):
+                raise InvokeConnectionError(str(ex))
+            elif isinstance(ex, openai.AuthenticationError):
+                raise InvokeAuthorizationError(str(ex))
+            elif isinstance(ex, openai.RateLimitError):
+                raise InvokeRateLimitError(str(ex))
+            elif isinstance(ex, openai.BadRequestError):
+                raise InvokeBadRequestError(str(ex))
+            elif isinstance(ex, openai.InternalServerError):
+                raise InvokeServerUnavailableError(str(ex))
+        except ImportError:
+            pass
+        raise InvokeError(str(ex))
+
+    def _get_mantle_auth_token(self, credentials: dict) -> str:
+        """
+        Return a Bearer token for the bedrock-mantle endpoint.
+
+        - API_Key auth: use the long-term Bedrock API key directly.
+        - Access_Secret_Key / IAM_Role: generate a short-lived token via
+          aws-bedrock-token-generator (official AWS library).
+        """
+        auth_method = credentials.get("auth_method", "IAM_Role")
+        region = credentials.get("aws_region", "us-east-2")
+
+        if auth_method == "API_Key":
+            api_key = credentials.get("bedrock_api_key")
+            if not api_key:
+                raise InvokeBadRequestError("bedrock_api_key is required for API_Key auth")
+            return api_key
+
+        # IAM_Role or Access_Secret_Key: generate a short-lived bearer token.
+        try:
+            from aws_bedrock_token_generator import provide_token
+        except ImportError:
+            raise InvokeBadRequestError(
+                "aws-bedrock-token-generator is required for IAM-based authentication "
+                "with GPT-5.5/5.4. Install it with: pip install aws-bedrock-token-generator"
+            )
+
+        aws_access_key_id = credentials.get("aws_access_key_id")
+        aws_secret_access_key = credentials.get("aws_secret_access_key")
+
+        if auth_method == "Access_Secret_Key" and aws_access_key_id and aws_secret_access_key:
+            from botocore.credentials import Credentials as BotocoreCredentials
+            creds = BotocoreCredentials(
+                access_key=aws_access_key_id,
+                secret_key=aws_secret_access_key,
+                token=credentials.get("aws_session_token"),
+            )
+            return provide_token(region=region, aws_credentials_provider=creds)
+
+        # IAM_Role: rely on the environment (instance profile, env vars, etc.)
+        return provide_token(region=region)
+
+    def _build_responses_api_input(self, prompt_messages: list[PromptMessage]) -> list[dict]:
+        """Convert Dify prompt messages to OpenAI Responses API input format."""
+        result = []
+        for message in prompt_messages:
+            if isinstance(message, SystemPromptMessage):
+                result.append({"role": "system", "content": message.content or ""})
+            elif isinstance(message, UserPromptMessage):
+                if isinstance(message.content, str):
+                    content = message.content
+                else:
+                    content = " ".join(
+                        c.data for c in message.content
+                        if c.type == PromptMessageContentType.TEXT
+                    )
+                result.append({"role": "user", "content": content})
+            elif isinstance(message, AssistantPromptMessage):
+                result.append({"role": "assistant", "content": message.content or ""})
+        return result
+
+    def _generate_with_responses_api(
+        self,
+        model_id: str,
+        credentials: dict,
+        prompt_messages: list[PromptMessage],
+        model_parameters: dict,
+        stop: Optional[list[str]] = None,
+        stream: bool = True,
+        user: Optional[str] = None,
+    ) -> Union[LLMResult, Generator]:
+        """
+        Invoke GPT-5.5 / GPT-5.4 via bedrock-mantle endpoint using the OpenAI Responses API.
+        Authentication supports API Key, Access/Secret Key, and IAM Role.
+        """
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise InvokeBadRequestError(
+                "openai package is required for GPT-5.5/5.4. "
+                "Install it with: pip install openai"
+            )
+
+        region = credentials.get("aws_region", "us-east-2")
+        token = self._get_mantle_auth_token(credentials)
+        base_url = f"https://bedrock-mantle.{region}.api.aws/openai/v1"
+
+        client = OpenAI(api_key=token, base_url=base_url)
+        input_messages = self._build_responses_api_input(prompt_messages)
+
+        params: dict = {
+            "model": model_id,
+            "input": input_messages,
+            "stream": stream,
+        }
+
+        # Copy to avoid mutating the caller's dict (retry mechanisms may reuse it).
+        model_parameters = model_parameters.copy()
+        model_name = model_parameters.pop("model_name", None)
+        model_parameters.pop("cross-region", None)
+        model_parameters.pop("system_cache_checkpoint", None)
+        model_parameters.pop("latest_two_messages_cache_checkpoint", None)
+        model_parameters.pop("response_format", None)
+
+        if "max_tokens" in model_parameters:
+            params["max_output_tokens"] = model_parameters["max_tokens"]
+        if "temperature" in model_parameters:
+            params["temperature"] = model_parameters["temperature"]
+        if "top_p" in model_parameters:
+            params["top_p"] = model_parameters["top_p"]
+
+        # Store model_name for pricing calculation, deriving it from model_id if not set.
+        credentials_for_pricing = credentials.copy()
+        resolved_model_name = model_name or ("GPT-5.5" if "gpt-5.5" in model_id else "GPT-5.4")
+        credentials_for_pricing["model_parameters"] = {
+            **credentials_for_pricing.get("model_parameters", {}),
+            "model_name": resolved_model_name,
+        }
+
+        try:
+            response = client.responses.create(**params)
+            if stream:
+                return self._handle_responses_api_stream(
+                    model_id, credentials_for_pricing, response, prompt_messages
+                )
+            else:
+                return self._handle_responses_api_response(
+                    model_id, credentials_for_pricing, response, prompt_messages
+                )
+        except Exception as ex:
+            self._map_openai_exception(ex)
+
+    def _handle_responses_api_response(
+        self,
+        model: str,
+        credentials: dict,
+        response,
+        prompt_messages: list[PromptMessage],
+    ) -> LLMResult:
+        """Convert a non-streaming OpenAI Responses API response to LLMResult."""
+        text = response.output_text or ""
+        usage = getattr(response, "usage", None)
+        prompt_tokens = getattr(usage, "input_tokens", 0) if usage else 0
+        completion_tokens = getattr(usage, "output_tokens", 0) if usage else 0
+        dify_usage = self._calc_response_usage(model, credentials, prompt_tokens, completion_tokens)
+
+        return LLMResult(
+            model=model,
+            prompt_messages=prompt_messages,
+            message=AssistantPromptMessage(content=text),
+            usage=dify_usage,
+        )
+
+    def _handle_responses_api_stream(
+        self,
+        model: str,
+        credentials: dict,
+        stream_response,
+        prompt_messages: list[PromptMessage],
+    ) -> Generator:
+        """Convert a streaming OpenAI Responses API response to LLMResultChunk generator."""
+        index = 0
+        input_tokens = 0
+        output_tokens = 0
+
+        try:
+            for event in stream_response:
+                event_type = type(event).__name__
+
+                if event_type == "ResponseTextDeltaEvent":
+                    delta_text = getattr(event, "delta", "")
+                    if delta_text:
+                        yield LLMResultChunk(
+                            model=model,
+                            prompt_messages=prompt_messages,
+                            delta=LLMResultChunkDelta(
+                                index=index,
+                                message=AssistantPromptMessage(content=delta_text),
+                            ),
+                        )
+                        index += 1
+
+                elif event_type == "ResponseCompletedEvent":
+                    resp = getattr(event, "response", None)
+                    usage = getattr(resp, "usage", None) if resp else None
+                    if usage:
+                        input_tokens = getattr(usage, "input_tokens", 0)
+                        output_tokens = getattr(usage, "output_tokens", 0)
+                    dify_usage = self._calc_response_usage(
+                        model, credentials, input_tokens, output_tokens
+                    )
+                    yield LLMResultChunk(
+                        model=model,
+                        prompt_messages=prompt_messages,
+                        delta=LLMResultChunkDelta(
+                            index=index,
+                            message=AssistantPromptMessage(content=""),
+                            finish_reason="stop",
+                            usage=dify_usage,
+                        ),
+                    )
+        except Exception as ex:
+            self._map_openai_exception(ex)

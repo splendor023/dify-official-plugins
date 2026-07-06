@@ -1,8 +1,9 @@
 import urllib.parse
-from typing import Any, Union, Generator
+from typing import Any, Generator, Union
+
 import requests
-from dify_plugin.entities.tool import ToolInvokeMessage
 from dify_plugin import Tool
+from dify_plugin.entities.tool import ToolInvokeMessage
 
 
 class GitlabFilesTool(Tool):
@@ -30,7 +31,7 @@ class GitlabFilesTool(Tool):
         if repository:
             result = self.fetch_files(site_url, access_token, repository, branch, path, True, ssl_verify)
         else:
-            project_id = self.get_project_id(site_url, access_token, repository)
+            project_id = self.get_project_id(site_url, access_token, project)
             if project_id:
                 result = self.fetch_files(site_url, access_token, project, branch, path, False, ssl_verify)
 
@@ -67,7 +68,7 @@ class GitlabFilesTool(Tool):
                         if is_repository:
                             file_url = f"{domain}/api/v4/projects/{encoded_identifier}/repository/files/{encoded_item_path}/raw?ref={branch}"
                         else:
-                            file_url = f"{domain}/api/v4/projects/{project_id}/repository/files{encoded_item_path}/raw?ref={branch}"
+                            file_url = f"{domain}/api/v4/projects/{project_id}/repository/files/{encoded_item_path}/raw?ref={branch}"
                         file_response = requests.get(file_url, headers=headers, verify=ssl_verify)
                         file_response.raise_for_status()
                         file_content = file_response.text

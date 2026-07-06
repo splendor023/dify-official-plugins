@@ -1,2 +1,0 @@
-dify_plugin==0.0.1b68
-zhipuai==2.1.5.20250106

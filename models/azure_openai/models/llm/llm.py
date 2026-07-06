@@ -1,10 +1,16 @@
+import base64
 import copy
+import io
 import json
 import logging
-from collections.abc import Generator, Sequence
 import math
-from typing import Optional, Union, cast
+import re
+from collections.abc import Generator, Sequence
+from typing import Any, Optional, Union, cast
+from urllib.parse import urlparse
+
 import tiktoken
+from PIL import Image
 from dify_plugin.entities.model import AIModelEntity, ModelPropertyKey
 from dify_plugin.entities.model.llm import (
     LLMMode,
@@ -14,9 +20,12 @@ from dify_plugin.entities.model.llm import (
 )
 from dify_plugin.entities.model.message import (
     AssistantPromptMessage,
+    AudioPromptMessageContent,
+    DocumentPromptMessageContent,
     ImagePromptMessageContent,
     PromptMessage,
     PromptMessageContentType,
+    PromptMessageContentUnionTypes,
     PromptMessageFunction,
     PromptMessageTool,
     SystemPromptMessage,
@@ -26,21 +35,22 @@ from dify_plugin.entities.model.message import (
 )
 from dify_plugin.errors.model import CredentialsValidateFailedError
 from dify_plugin.interfaces.model.large_language_model import LargeLanguageModel
-from openai import AzureOpenAI, Stream
+from openai import Stream
 from openai.types import Completion
 from openai.types.chat import (
     ChatCompletion,
     ChatCompletionChunk,
     ChatCompletionMessageToolCall,
 )
-from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall
+from openai.types.chat.chat_completion_chunk import ChoiceDelta, ChoiceDeltaToolCall
+from openai.types.responses import ResponseStreamEvent, Response
+
 from ..common import _CommonAzureOpenAI
-from ..constants import LLM_BASE_MODELS
-from PIL import Image
-import base64
-import io
+from ..constants import LLM_BASE_MODELS, uses_responses_api
 
 logger = logging.getLogger(__name__)
+
+THINKING_SERIES_COMPATIBILITY = ("o", "gpt-5")
 
 
 class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
@@ -59,7 +69,18 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
         ai_model_entity = self._get_ai_model_entity(
             base_model_name=base_model_name, model=model
         )
-        if (
+        if self._uses_responses_api(base_model_name):
+            return self._chat_generate_with_responses(
+                model=model,
+                credentials=credentials,
+                prompt_messages=prompt_messages,
+                model_parameters=model_parameters,
+                tools=tools,
+                stop=stop,
+                stream=stream,
+                user=user,
+            )
+        elif (
             ai_model_entity
             and ai_model_entity.entity.model_properties.get(ModelPropertyKey.MODE)
             == LLMMode.CHAT.value
@@ -111,8 +132,14 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
             raise CredentialsValidateFailedError(
                 "Azure OpenAI API Base Endpoint is required"
             )
-        if "openai_api_key" not in credentials:
-            raise CredentialsValidateFailedError("Azure OpenAI API key is required")
+
+        # Check authentication method
+        auth_method = credentials.get("auth_method", "api_key")
+        if auth_method == "api_key" and "openai_api_key" not in credentials:
+            raise CredentialsValidateFailedError(
+                "Azure OpenAI API key is required when using API Key authentication"
+            )
+
         if "base_model_name" not in credentials:
             raise CredentialsValidateFailedError("Base Model Name is required")
         base_model_name = self._get_base_model_name(credentials)
@@ -123,9 +150,16 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
             raise CredentialsValidateFailedError(
                 f"Base Model Name {credentials['base_model_name']} is invalid"
             )
+
         try:
-            client = AzureOpenAI(**self._to_credential_kwargs(credentials))
-            if base_model_name.startswith(("o1", "o3", "o4")):
+            client = self._create_client(credentials, use_cache=False)
+            if self._uses_responses_api(base_model_name):
+                client.responses.create(
+                    input="ping",
+                    model=model,
+                    stream=False,
+                )
+            elif base_model_name.startswith(THINKING_SERIES_COMPATIBILITY):
                 client.chat.completions.create(
                     messages=[{"role": "user", "content": "ping"}],
                     model=model,
@@ -159,9 +193,7 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
         self, model: str, credentials: dict
     ) -> Optional[AIModelEntity]:
         base_model_name = self._get_base_model_name(credentials)
-        ai_model_entity = self._get_ai_model_entity(
-            base_model_name=base_model_name, model=model
-        )
+        ai_model_entity = self._get_ai_model_entity(base_model_name, model)
         return ai_model_entity.entity if ai_model_entity else None
 
     def _generate(
@@ -174,12 +206,16 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
         stream: bool = True,
         user: Optional[str] = None,
     ) -> Union[LLMResult, Generator]:
-        client = AzureOpenAI(**self._to_credential_kwargs(credentials))
+        client = self._create_client(credentials)
         extra_model_kwargs = {}
         if stop:
             extra_model_kwargs["stop"] = stop
         if user:
             extra_model_kwargs["user"] = user
+
+        # client.completions does not support reasoning_effort
+        if "reasoning_effort" in model_parameters:
+            model_parameters.pop("reasoning_effort")
         response = client.completions.create(
             prompt=prompt_messages[0].content,
             model=model,
@@ -187,6 +223,7 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
             **model_parameters,
             **extra_model_kwargs,
         )
+
         if stream:
             return self._handle_generate_stream_response(
                 model, credentials, response, prompt_messages
@@ -234,12 +271,14 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
         prompt_messages: list[PromptMessage],
     ) -> Generator:
         full_text = ""
+
         for chunk in response:
             if len(chunk.choices) == 0:
                 continue
             delta = chunk.choices[0]
             if delta.finish_reason is None and (delta.text is None or delta.text == ""):
                 continue
+
             text = delta.text or ""
             assistant_prompt_message = AssistantPromptMessage(content=text)
             full_text += text
@@ -257,6 +296,7 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
                 usage = self._calc_response_usage(
                     model, credentials, prompt_tokens, completion_tokens
                 )
+
                 yield LLMResultChunk(
                     model=chunk.model,
                     prompt_messages=prompt_messages,
@@ -290,7 +330,7 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
         user: Optional[str] = None,
     ) -> Union[LLMResult, Generator]:
         base_model_name = self._get_base_model_name(credentials)
-        client = AzureOpenAI(**self._to_credential_kwargs(credentials))
+        client = self._create_client(credentials)
         response_format = model_parameters.get("response_format")
         if response_format:
             if response_format == "json_schema":
@@ -321,14 +361,14 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
         if stop:
             extra_model_kwargs["stop"] = stop
         if user:
-            extra_model_kwargs["user"] = user
+            extra_model_kwargs["safety_identifier"] = user
         if stream:
             extra_model_kwargs["stream_options"] = {"include_usage": True}
         prompt_messages = self._clear_illegal_prompt_messages(
             base_model_name, prompt_messages
         )
         block_as_stream = False
-        if base_model_name.startswith(("o1", "o3", "o4")):
+        if base_model_name.startswith(THINKING_SERIES_COMPATIBILITY):
             # o1 and o1-* do not support streaming
             # https://learn.microsoft.com/en-us/azure/ai-services/openai/how-to/reasoning#api--feature-support
             if base_model_name.startswith("o1"):
@@ -339,13 +379,18 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
                         del extra_model_kwargs["stream_options"]
             if "stop" in extra_model_kwargs:
                 del extra_model_kwargs["stop"]
+
+        messages: Any = [
+            self._convert_prompt_message_to_dict(m) for m in prompt_messages
+        ]
         response = client.chat.completions.create(
-            messages=[self._convert_prompt_message_to_dict(m) for m in prompt_messages],
+            messages=messages,
             model=model,
             stream=stream,
             **model_parameters,
             **extra_model_kwargs,
         )
+
         if stream:
             return self._handle_chat_generate_stream_response(
                 model, credentials, response, prompt_messages, tools
@@ -357,7 +402,684 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
             return self._handle_chat_block_as_stream_response(
                 block_result, prompt_messages, stop
             )
+
         return block_result
+
+    def _chat_generate_with_responses(
+        self,
+        model: str,
+        credentials: dict,
+        prompt_messages: list[PromptMessage],
+        model_parameters: dict,
+        tools: Optional[list[PromptMessageTool]] = None,
+        stop: Optional[list[str]] = None,
+        stream: bool = True,
+        user: Optional[str] = None,
+    ) -> Union[LLMResult, Generator]:
+        """
+        Generate chat responses with the OpenAI Responses API.
+
+        Reference: https://platform.openai.com/docs/guides/migrate-to-responses
+        """
+        base_model_name = self._get_base_model_name(credentials)
+        client = self._create_client(credentials)
+
+        # Whether this model is a pure reasoning model (gpt-5, gpt-5-mini, etc.)
+        # that does NOT support temperature, top_p, or stop sequences.
+        # gpt-5-chat and gpt-5-codex use different APIs and are excluded here.
+        is_reasoning_model = self._uses_responses_api(base_model_name) and (
+            base_model_name.startswith("gpt-5")
+            and "chat" not in base_model_name
+            and "codex" not in base_model_name
+        )
+
+        # Convert prompt messages to the Responses API format
+        input_messages = self._convert_prompt_messages_to_responses_input(prompt_messages)
+
+        # Build parameters for the Responses API
+        responses_params = {
+            "model": model,
+            "input": input_messages,
+        }
+
+        # Map model parameters to the Responses API.
+        # temperature and top_p are not supported by gpt-5 reasoning models.
+        if not is_reasoning_model:
+            if "temperature" in model_parameters:
+                responses_params["temperature"] = model_parameters["temperature"]
+            if "top_p" in model_parameters:
+                responses_params["top_p"] = model_parameters["top_p"]
+        if "max_tokens" in model_parameters:
+            responses_params["max_output_tokens"] = model_parameters["max_tokens"]
+        elif "max_completion_tokens" in model_parameters:
+            responses_params["max_output_tokens"] = model_parameters["max_completion_tokens"]
+
+        web_search_tool, include_web_search_sources = self._extract_web_search_configuration(
+            model_parameters
+        )
+        response_tools = []
+
+        # Handle function tools in the Responses API format.
+        if tools:
+            for tool in tools:
+                # Ensure parameters are valid JSON objects
+                parameters = tool.parameters
+                if isinstance(parameters, str):
+                    try:
+                        parameters = json.loads(parameters)
+                    except json.JSONDecodeError:
+                        parameters = {"type": "object", "properties": {}}
+                elif not isinstance(parameters, dict):
+                    parameters = {"type": "object", "properties": {}}
+
+                tool_dict = {
+                    "type": "function",
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "parameters": parameters
+                }
+                response_tools.append(tool_dict)
+
+        if web_search_tool:
+            response_tools.append(web_search_tool)
+
+        if response_tools:
+            responses_params["tools"] = response_tools
+            responses_params["tool_choice"] = "auto"
+
+        if include_web_search_sources and web_search_tool:
+            include_fields = responses_params.get("include")
+            if not isinstance(include_fields, list):
+                include_fields = []
+            include_item = "web_search_call.action.sources"
+            if include_item not in include_fields:
+                include_fields.append(include_item)
+            responses_params["include"] = include_fields
+
+        # Handle the user identifier
+        if user:
+            responses_params["safety_identifier"] = user
+
+        # stop sequences are not supported by gpt-5 reasoning models
+        if stop and not is_reasoning_model:
+            responses_params["stop"] = stop
+
+        # Handle the response format
+        response_format = model_parameters.get("response_format")
+        if response_format:
+            if response_format == "json_schema":
+                json_schema_data = model_parameters.get("json_schema", {})
+                # Ensure json_schema is an object rather than a string
+                if isinstance(json_schema_data, str):
+                    try:
+                        json_schema_data = json.loads(json_schema_data)
+                    except json.JSONDecodeError:
+                        json_schema_data = {}
+
+                raw_schema = json_schema_data.get("schema", {})
+                adapted_schema = self._adapt_schema_for_structured_outputs(raw_schema)
+                responses_params["text"] = {
+                    "format": {
+                        "type": "json_schema",
+                        "name": json_schema_data.get("name", "response"),
+                        "schema": adapted_schema
+                    }
+                }
+            else:
+                responses_params["text"] = {
+                    "format": {"type": response_format}
+                }
+
+        # Handle verbosity
+        if "verbosity" in model_parameters:
+            if "text" not in responses_params:
+                responses_params["text"] = {}
+            responses_params["text"]["verbosity"] = model_parameters["verbosity"]
+
+        # Handle reasoning parameters
+        reasoning = {}
+        if "reasoning_effort" in model_parameters:
+            reasoning["effort"] = model_parameters["reasoning_effort"]
+        if "reasoning_summary" in model_parameters:
+            reasoning["summary"] = model_parameters["reasoning_summary"]
+        if reasoning:
+            responses_params["reasoning"] = reasoning
+
+        logger.info(
+            f"llm request with responses api: model={model}, stream={stream}, "
+            f"parameters={responses_params}"
+        )
+
+        # Call the Responses API
+        response = client.responses.create(
+            **responses_params,
+            stream=stream,
+        )
+
+        if stream:
+            return self._handle_responses_stream_response(
+                model, credentials, response, prompt_messages, tools
+            )
+        else:
+            return self._handle_responses_response(
+                model, credentials, response, prompt_messages, tools
+            )
+
+    @staticmethod
+    def _extract_web_search_configuration(
+        model_parameters: dict,
+    ) -> tuple[Optional[dict[str, Any]], bool]:
+        enable_web_search = model_parameters.pop("enable_web_search", False)
+        include_sources = model_parameters.pop("web_search_include_sources", False)
+        country = model_parameters.pop("web_search_user_country", None)
+        allowed_domains = model_parameters.pop("web_search_allowed_domains", None)
+
+        if not enable_web_search:
+            return None, False
+
+        web_search_tool: dict[str, Any] = {"type": "web_search"}
+
+        if country is not None:
+            normalized_country = str(country).strip().upper()
+            if normalized_country:
+                if not re.fullmatch(r"[A-Z]{2}", normalized_country):
+                    raise ValueError(
+                        "web_search_user_country must be a 2-letter ISO country code."
+                    )
+                web_search_tool["user_location"] = {
+                    "type": "approximate",
+                    "country": normalized_country,
+                }
+
+        normalized_domains = AzureOpenAILargeLanguageModel._normalize_allowed_domains(
+            allowed_domains
+        )
+        if normalized_domains:
+            web_search_tool["filters"] = {"allowed_domains": normalized_domains}
+
+        return web_search_tool, include_sources
+
+    @staticmethod
+    def _normalize_allowed_domains(raw_domains: Any) -> list[str]:
+        if raw_domains is None:
+            return []
+
+        if isinstance(raw_domains, str):
+            candidates = re.split(r"[\s,\n\r]+", raw_domains)
+        elif isinstance(raw_domains, Sequence):
+            candidates = [str(item) for item in raw_domains]
+        else:
+            candidates = [str(raw_domains)]
+
+        normalized_domains: list[str] = []
+        seen_domains: set[str] = set()
+
+        for candidate in candidates:
+            token = candidate.strip()
+            if not token:
+                continue
+
+            parsed = urlparse(token if "://" in token else f"https://{token}")
+            host = parsed.netloc
+            host = host.strip().lower().rstrip(".")
+            if ":" in host:
+                host = host.split(":", 1)[0]
+
+            if not host:
+                continue
+            if not re.fullmatch(r"[a-z0-9.-]+", host):
+                raise ValueError(f"Invalid domain in web_search_allowed_domains: {token}")
+
+            if host not in seen_domains:
+                seen_domains.add(host)
+                normalized_domains.append(host)
+
+        if len(normalized_domains) > 100:
+            raise ValueError("web_search_allowed_domains can contain at most 100 domains.")
+
+        return normalized_domains
+
+    def _convert_prompt_messages_to_responses_input(
+        self, prompt_messages: list[PromptMessage]
+    ) -> list[dict]:
+        """Convert prompt messages to the Responses API input format."""
+        input_messages = []
+
+        for message in prompt_messages:
+            if isinstance(message, SystemPromptMessage):
+                if isinstance(message.content, str):
+                    input_messages.append({
+                        "role": "developer",
+                        "content": message.content
+                    })
+                else:
+                    content_parts = AzureOpenAILargeLanguageModel._convert_multimodal_content_to_responses_parts(
+                        message.content
+                    )
+                    if content_parts:
+                        input_messages.append({
+                            "role": "developer",
+                            "content": content_parts
+                        })
+            elif isinstance(message, UserPromptMessage):
+                if isinstance(message.content, str):
+                    input_messages.append({
+                        "role": "user",
+                        "content": message.content
+                    })
+                else:
+                    # Handle multimodal content
+                    content_parts = AzureOpenAILargeLanguageModel._convert_multimodal_content_to_responses_parts(
+                        message.content
+                    )
+                    if content_parts:
+                        input_messages.append({
+                            "role": "user",
+                            "content": content_parts
+                        })
+                    else:
+                        # All content items were unsupported types (e.g. VIDEO).
+                        # Do NOT append {"role": "user", "content": []} —
+                        # the Azure Responses API rejects empty content arrays
+                        # with "Unsupported data type".
+                        logger.debug(
+                            "Skipping UserPromptMessage: no content items could be "
+                            "converted to a Responses API format."
+                        )
+            elif isinstance(message, AssistantPromptMessage):
+                # If the assistant message contains tool_calls, emit each as a
+                # Responses API function_call item (type="function_call").
+                # A plain-text assistant turn is emitted as a normal message item.
+                if message.tool_calls:
+                    for tc in message.tool_calls:
+                        input_messages.append({
+                            "type": "function_call",
+                            "call_id": tc.id,
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        })
+                else:
+                    if message.content:
+                        input_messages.append({
+                            "role": "assistant",
+                            "content": message.content,
+                        })
+            elif isinstance(message, ToolPromptMessage):
+                # Responses API requires tool results as function_call_output items.
+                # The call_id links back to the function_call item
+                # that triggered this tool call.
+                input_messages.append({
+                    "type": "function_call_output",
+                    "call_id": message.tool_call_id,
+                    "output": message.content,
+                })
+
+        return input_messages
+
+    @staticmethod
+    def _convert_multimodal_content_to_responses_parts(
+        content_items: Optional[list[PromptMessageContentUnionTypes]],
+    ) -> list[dict[str, Any]]:
+        content_parts: list[dict[str, Any]] = []
+        for content_item in content_items or []:
+            if content_item.type == PromptMessageContentType.TEXT:
+                text_content = cast(TextPromptMessageContent, content_item)
+                content_parts.append({
+                    "type": "input_text",
+                    "text": text_content.data
+                })
+            elif content_item.type == PromptMessageContentType.IMAGE:
+                image_content = cast(ImagePromptMessageContent, content_item)
+                image_part = {
+                    "type": "input_image",
+                }
+                if image_content.url:
+                    image_part["image_url"] = image_content.url
+                else:
+                    image_part["image_url"] = image_content.data
+                if image_content.detail:
+                    image_part["detail"] = image_content.detail.value
+                content_parts.append(image_part)
+            elif content_item.type == PromptMessageContentType.DOCUMENT:
+                doc_content = cast(DocumentPromptMessageContent, content_item)
+                file_part: dict[str, Any] = {"type": "input_file"}
+                if doc_content.url:
+                    file_part["file_url"] = doc_content.url
+                elif doc_content.base64_data:
+                    file_part["filename"] = doc_content.filename or "document"
+                    file_part["file_data"] = (
+                        f"data:{doc_content.mime_type};base64,{doc_content.base64_data}"
+                    )
+                if len(file_part) > 1:
+                    content_parts.append(file_part)
+        return content_parts
+
+    def _handle_responses_response(
+        self,
+        model: str,
+        credentials: dict,
+        response: Response,
+        prompt_messages: list[PromptMessage],
+        tools: Optional[list[PromptMessageTool]] = None,
+    ) -> LLMResult:
+        """Handle non-streaming Responses API responses."""
+        # Extract text content
+        content = ""
+
+        # Inspect the actual response structure
+        if hasattr(response, 'output') and response.output:
+            # Standard Responses API format
+            for item in response.output:
+                item_type = getattr(item, 'type', '')
+                if item_type == "reasoning":
+                    # Reasoning summary: wrap with <think> tags
+                    summary_list = getattr(item, 'summary', [])
+                    summary_text = "\n".join(
+                        s.text for s in summary_list if hasattr(s, 'text') and s.text
+                    )
+                    if summary_text:
+                        content += "<think>\n" + summary_text + "\n</think>"
+                elif item_type == "message":
+                    # message.content can be a string or a list of segments
+                    item_content = getattr(item, 'content', None)
+                    if isinstance(item_content, str):
+                        if item_content:
+                            content += item_content
+                    elif isinstance(item_content, list):
+                        for part in item_content:
+                            part_type = getattr(part, 'type', '')
+                            if part_type in ("output_text", "text", "input_text"):
+                                text_val = getattr(part, 'text', '')
+                                if text_val:
+                                    content += text_val
+                elif item_type in ("output_text", "text"):
+                    # Some implementations return output_text/text entries directly
+                    text_val = getattr(item, 'text', '')
+                    if text_val:
+                        content += text_val
+        elif hasattr(response, 'text') and response.text:
+            # Fallback format
+            content = response.text
+        elif hasattr(response, 'content') and response.content:
+            # Direct content format
+            content = response.content
+
+        # Handle tool calls
+        tool_calls = []
+        if hasattr(response, 'output') and response.output:
+            for item in response.output:
+                item_type = getattr(item, 'type', '')
+                if item_type == "function_call":
+                    # Handle the Responses API tool call format
+                    function_name = getattr(item, 'name', '')
+                    function_args = getattr(item, 'arguments', '')
+                    call_id = getattr(item, 'call_id', '') or getattr(item, 'id', '')
+
+                    # Ensure the arguments are valid JSON strings
+                    if isinstance(function_args, dict):
+                        args_str = json.dumps(function_args)
+                    elif isinstance(function_args, str):
+                        args_str = function_args
+                    else:
+                        args_str = "{}"
+
+                    tool_call = AssistantPromptMessage.ToolCall(
+                        id=call_id,
+                        type="function",
+                        function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                            name=function_name,
+                            arguments=args_str
+                        )
+                    )
+                    tool_calls.append(tool_call)
+
+        assistant_prompt_message = AssistantPromptMessage(
+            content=content,
+            tool_calls=tool_calls
+        )
+
+        # Calculate token usage
+        prompt_tokens = 0
+        completion_tokens = 0
+
+        if hasattr(response, 'usage') and response.usage:
+            usage_obj = response.usage
+            # Support Responses API usage fields
+            prompt_tokens = getattr(usage_obj, 'input_tokens', None) or getattr(usage_obj, 'prompt_tokens', 0)
+            completion_tokens = getattr(usage_obj, 'output_tokens', None) or getattr(usage_obj, 'completion_tokens', 0)
+        else:
+            # Estimate usage when it is not provided
+            prompt_tokens = self._num_tokens_from_messages(
+                credentials, prompt_messages, tools
+            )
+            completion_tokens = self._num_tokens_from_messages(
+                credentials, [assistant_prompt_message]
+            )
+
+        usage = self._calc_response_usage(
+            model, credentials, prompt_tokens, completion_tokens,
+        )
+
+        return LLMResult(
+            model=model,
+            prompt_messages=prompt_messages,
+            message=assistant_prompt_message,
+            usage=usage,
+            system_fingerprint=getattr(response, 'id', ''),
+        )
+
+    def _handle_responses_stream_response(
+        self,
+        model: str,
+        credentials: dict,
+        response: Stream[ResponseStreamEvent],
+        prompt_messages: list[PromptMessage],
+        tools: Optional[list[PromptMessageTool]] = None,
+    ) -> Generator:
+        """Handle streaming Responses API responses."""
+        full_text = ""
+        tool_calls = []
+        index = 0
+        is_first = True
+        is_reasoning = False
+
+        # Track tool call state
+        pending_tool_calls = {}  # call_id -> tool_call_dict
+        current_tool_call = None
+
+        for chunk in response:
+            if is_first:
+                is_first = False
+
+            # Handle the Responses API streaming event format
+            chunk_type = getattr(chunk, 'type', '')
+
+            if chunk_type == 'response.reasoning_summary_text.delta':
+                # Reasoning summary delta - wrap with <think> tags
+                delta_text = getattr(chunk, 'delta', '')
+                if delta_text:
+                    if not is_reasoning:
+                        delta_text = "<think>\n" + delta_text
+                        is_reasoning = True
+                    full_text += delta_text
+
+                    assistant_prompt_message = AssistantPromptMessage(
+                        content=delta_text,
+                        tool_calls=[]
+                    )
+
+                    yield LLMResultChunk(
+                        model=model,
+                        prompt_messages=prompt_messages,
+                        system_fingerprint=getattr(chunk, 'item_id', ''),
+                        delta=LLMResultChunkDelta(
+                            index=index,
+                            message=assistant_prompt_message
+                        ),
+                    )
+                    index += 1
+
+            elif chunk_type == 'response.output_text.delta':
+                # ResponseTextDeltaEvent format - text delta
+                delta_text = getattr(chunk, 'delta', '')
+                if delta_text:
+                    if is_reasoning:
+                        # Close the <think> block before regular text
+                        delta_text = "\n</think>" + delta_text
+                        is_reasoning = False
+                    full_text += delta_text
+
+                    assistant_prompt_message = AssistantPromptMessage(
+                        content=delta_text,
+                        tool_calls=[]
+                    )
+
+                    yield LLMResultChunk(
+                        model=model,
+                        prompt_messages=prompt_messages,
+                        system_fingerprint=getattr(chunk, 'item_id', ''),
+                        delta=LLMResultChunkDelta(
+                            index=index,
+                            message=assistant_prompt_message
+                        ),
+                    )
+                    index += 1
+
+            elif chunk_type == 'response.output_item.added':
+                # ResponseOutputItemAddedEvent format - tool call start
+                item = getattr(chunk, 'item', None)
+                if item and hasattr(item, 'type'):
+                    item_type = getattr(item, 'type', '')
+
+                    if item_type == 'function_call':
+                        # Tool call start - initialize the tool call object
+                        function_name = getattr(item, 'name', '')
+                        call_id = getattr(item, 'call_id', '')
+
+                        if function_name and call_id:
+                            pending_tool_calls[call_id] = {
+                                'id': call_id,
+                                'name': function_name,
+                                'arguments': ''  # Start empty and wait for argument deltas
+                            }
+                            current_tool_call = call_id
+
+            elif chunk_type == 'response.function_call_arguments.delta':
+                # ResponseFunctionCallArgumentsDeltaEvent format - tool argument delta
+                delta_args = getattr(chunk, 'delta', '')
+
+                # Use the currently tracked tool call
+                if current_tool_call and current_tool_call in pending_tool_calls:
+                    # Append arguments to the existing tool call
+                    pending_tool_calls[current_tool_call]['arguments'] += delta_args
+
+            elif chunk_type == 'response.function_call_arguments.done':
+                # ResponseFunctionCallArgumentsDoneEvent format - tool arguments complete
+                call_id = getattr(chunk, 'item_id', '')
+                final_args = getattr(chunk, 'arguments', '')
+
+                if call_id and call_id in pending_tool_calls:
+                    # Update the tool call with the completed arguments
+                    pending_tool_calls[call_id]['arguments'] = final_args
+
+            elif chunk_type == 'response.output_item.done':
+                # ResponseOutputItemDoneEvent format - tool call complete
+                item = getattr(chunk, 'item', None)
+                if item and hasattr(item, 'type'):
+                    item_type = getattr(item, 'type', '')
+
+                    if item_type == 'function_call':
+                        # Tool call complete - emit the full tool call
+                        function_name = getattr(item, 'name', '')
+                        function_args = getattr(item, 'arguments', '')
+                        call_id = getattr(item, 'call_id', '')
+
+                        # Prefer the completed arguments (from response.function_call_arguments.done)
+                        if call_id in pending_tool_calls:
+                            final_args = pending_tool_calls[call_id]['arguments'] or function_args
+                        else:
+                            final_args = function_args
+
+                        if function_name:
+                            tool_call = AssistantPromptMessage.ToolCall(
+                                id=call_id,
+                                type="function",
+                                function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                                    name=function_name,
+                                    arguments=final_args or "{}"
+                                )
+                            )
+
+                            assistant_prompt_message = AssistantPromptMessage(
+                                content="",
+                                tool_calls=[tool_call]
+                            )
+
+                            yield LLMResultChunk(
+                                model=model,
+                                prompt_messages=prompt_messages,
+                                system_fingerprint=call_id,
+                                delta=LLMResultChunkDelta(
+                                    index=index,
+                                    message=assistant_prompt_message
+                                ),
+                            )
+                            index += 1
+
+                            # Clean up completed tool calls
+                            if call_id in pending_tool_calls:
+                                del pending_tool_calls[call_id]
+
+                            # Reset tracking for the current tool call
+                            if call_id == current_tool_call:
+                                current_tool_call = None
+
+            elif hasattr(chunk, 'delta') and hasattr(chunk.delta, 'text'):
+                # Handle alternative formats
+                delta_text = chunk.delta.text or ""
+                if delta_text:
+                    full_text += delta_text
+
+                    assistant_prompt_message = AssistantPromptMessage(
+                        content=delta_text,
+                        tool_calls=[]
+                    )
+
+                    yield LLMResultChunk(
+                        model=model,
+                        prompt_messages=prompt_messages,
+                        system_fingerprint=getattr(chunk, 'item_id', ''),
+                        delta=LLMResultChunkDelta(
+                            index=index,
+                            message=assistant_prompt_message
+                        ),
+                    )
+                    index += 1
+
+        # Handle the final usage statistics
+        prompt_tokens = self._num_tokens_from_messages(
+            credentials, prompt_messages, tools
+        )
+        full_assistant_prompt_message = AssistantPromptMessage(content=full_text)
+        completion_tokens = self._num_tokens_from_messages(
+            credentials, [full_assistant_prompt_message]
+        )
+
+        usage = self._calc_response_usage(
+            model, credentials, prompt_tokens, completion_tokens
+        )
+
+        yield LLMResultChunk(
+            model=model,
+            prompt_messages=prompt_messages,
+            system_fingerprint="",
+            delta=LLMResultChunkDelta(
+                index=index,
+                message=AssistantPromptMessage(content=""),
+                finish_reason="stop",
+                usage=usage,
+            ),
+        )
 
     def _handle_chat_block_as_stream_response(
         self,
@@ -454,8 +1176,19 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
         self._update_tool_calls(
             tool_calls=tool_calls, tool_calls_response=assistant_message_tool_calls
         )
+        content = ""
+        if hasattr(
+            assistant_message, "model_extra"
+        ) and assistant_message.model_extra.get("reasoning_content"):
+            content += (
+                "<think>\n"
+                + assistant_message.model_extra["reasoning_content"]
+                + "\n</think>"
+            )
+        content += assistant_message.content
+
         assistant_prompt_message = AssistantPromptMessage(
-            content=assistant_message.content, tool_calls=tool_calls
+            content=content, tool_calls=tool_calls
         )
         if response.usage:
             prompt_tokens = response.usage.prompt_tokens
@@ -487,8 +1220,8 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
         prompt_messages: list[PromptMessage],
         tools: Optional[list[PromptMessageTool]] = None,
     ):
+        is_reasoning = False
         index = 0
-        full_assistant_content = ""
         real_model = model
         system_fingerprint = None
         completion = ""
@@ -509,15 +1242,21 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
             self._update_tool_calls(
                 tool_calls=tool_calls, tool_calls_response=delta.delta.tool_calls
             )
-            if delta.finish_reason is None and (not delta.delta.content):
+            if (
+                delta.finish_reason is None
+                and not delta.delta.content
+                and not hasattr(delta.delta, "reasoning_content")
+            ):
                 continue
-            assistant_prompt_message = AssistantPromptMessage(
-                content=delta.delta.content or "", tool_calls=tool_calls
+            content, is_reasoning = self._azure_wrap_thinking_by_reasoning_content(
+                delta.delta, is_reasoning
             )
-            full_assistant_content += delta.delta.content or ""
+            assistant_prompt_message = AssistantPromptMessage(
+                content=content, tool_calls=tool_calls
+            )
             real_model = chunk.model
             system_fingerprint = chunk.system_fingerprint
-            completion += delta.delta.content or ""
+            completion += content
             yield LLMResultChunk(
                 model=real_model,
                 prompt_messages=prompt_messages,
@@ -538,6 +1277,7 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
         usage = self._calc_response_usage(
             model, credentials, prompt_tokens, completion_tokens
         )
+
         yield LLMResultChunk(
             model=real_model,
             prompt_messages=prompt_messages,
@@ -635,6 +1375,18 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
                             },
                         }
                         sub_messages.append(sub_message_dict)
+                    elif message_content.type == PromptMessageContentType.AUDIO:
+                        message_content = cast(
+                            AudioPromptMessageContent, message_content
+                        )
+                        sub_message_dict = {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": message_content.base64_data,
+                                "format": message_content.format,
+                            },
+                        }
+                        sub_messages.append(sub_message_dict)
                 message_dict = {"role": "user", "content": sub_messages}
         elif isinstance(message, AssistantPromptMessage):
             message_dict = {"role": "assistant", "content": message.content}
@@ -686,7 +1438,7 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
         Official documentation: https://github.com/openai/openai-cookbook/blob/
         main/examples/How_to_format_inputs_to_ChatGPT_models.ipynb"""
         model = credentials["base_model_name"]
-        if model.startswith(("o1", "o3", "o4", "gpt-4.1", "gpt-4.5")):
+        if model.startswith(("o1", "o3", "o4", "gpt-4.1", "gpt-4.5", "gpt-5")):
             model = "gpt-4o"
         try:
             encoding = tiktoken.encoding_for_model(model)
@@ -701,6 +1453,7 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
             model.startswith("gpt-35-turbo")
             or model.startswith("gpt-4")
             or model.startswith(("o1", "o3", "o4"))
+            or model.startswith("grok")
         ):
             tokens_per_message = 3
             tokens_per_name = 1
@@ -794,15 +1547,9 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
             if ai_model_entity.base_model_name == base_model_name:
                 ai_model_entity_copy = copy.deepcopy(ai_model_entity)
                 ai_model_entity_copy.entity.model = model
-                ai_model_entity_copy.entity.label.en_US = model
-                ai_model_entity_copy.entity.label.zh_Hans = model
+                ai_model_entity_copy.entity.label.en_us = model
+                ai_model_entity_copy.entity.label.zh_hans = model
                 return ai_model_entity_copy
-
-    def _get_base_model_name(self, credentials: dict) -> str:
-        base_model_name = credentials.get("base_model_name")
-        if not base_model_name:
-            raise ValueError("Base Model Name is required")
-        return base_model_name
 
     def _get_image_patches(self, n: int) -> float:
         return (n + 32 - 1) // 32
@@ -883,3 +1630,101 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
                     num_tokens += base_tokens + total_tiles * tile_tokens
 
         return num_tokens
+
+    @staticmethod
+    def _uses_responses_api(base_model_name: str) -> bool:
+        return uses_responses_api(base_model_name)
+
+    @staticmethod
+    def _adapt_schema_for_structured_outputs(schema: dict) -> dict:
+        """
+        Responses API (Structured Outputs) requires all properties defined in
+        an object schema to be listed in 'required'.
+
+        Fields not in 'required' are treated as optional by converting their type
+        to [original_type, "null"] following the OpenAI recommended approach, then
+        adding them to 'required'. This allows the model to return null when the
+        value is absent, emulating optional fields.
+
+        Reference: https://developers.openai.com/api/docs/guides
+                   /structured-outputs#supported-schemas
+
+        Applied recursively to nested object schemas.
+        """
+        if not isinstance(schema, dict):
+            return schema
+        schema = dict(schema)
+        schema_type = schema.get("type")
+
+        # Handle arrays of objects by recursing into `items`
+        is_array = schema_type == "array" or (
+            isinstance(schema_type, list) and "array" in schema_type
+        )
+        if is_array and "items" in schema and isinstance(schema.get("items"), dict):
+            schema["items"] = AzureOpenAILargeLanguageModel._adapt_schema_for_structured_outputs(schema["items"])
+
+        # Handle objects
+        is_object = schema_type == "object" or (
+            isinstance(schema_type, list) and "object" in schema_type
+        )
+        if is_object and "properties" in schema:
+            required = list(schema.get("required", []))
+            new_properties = {}
+            for key, prop in schema["properties"].items():
+                prop = dict(prop)
+                if key not in required:
+                    # Convert fields not in 'required' to null union type to emulate optional
+                    original_type = prop.get("type")
+                    if original_type is None:
+                        # No type specified: just add to required without type modification
+                        pass
+                    elif isinstance(original_type, list):
+                        # Already an array: append "null" if not already present
+                        if "null" not in original_type:
+                            prop["type"] = original_type + ["null"]
+                    else:
+                        # String type: convert to array and add "null"
+                        prop["type"] = [original_type, "null"]
+                    required.append(key)
+                # Recursively apply to nested schemas
+                new_properties[key] = AzureOpenAILargeLanguageModel._adapt_schema_for_structured_outputs(prop)
+            schema["properties"] = new_properties
+            schema["required"] = required
+        return schema
+
+    @staticmethod
+    def _azure_wrap_thinking_by_reasoning_content(
+        delta: ChoiceDelta, is_reasoning: bool
+    ) -> tuple[str, bool]:
+        """
+        If the reasoning response is from delta.get("reasoning_content"), we wrap
+        it with HTML think tag.
+        :param delta: delta dictionary from LLM streaming response
+        :param is_reasoning: is reasoning
+        :return: tuple of (processed_content, is_reasoning)
+        """
+
+        content = delta.content or ""
+        reasoning_content = (
+            delta.reasoning_content if hasattr(delta, "reasoning_content") else ""
+        )
+        try:
+            if reasoning_content:
+                try:
+                    if not is_reasoning:
+                        content = "<think>\n" + reasoning_content
+                        is_reasoning = True
+                    else:
+                        content = reasoning_content
+                except Exception as ex:
+                    raise ValueError(
+                        f"[_azure_wrap_thinking_by_reasoning_content-1] {ex}"
+                    ) from ex
+            elif is_reasoning and content:
+                content = "\n</think>" + content
+                is_reasoning = False
+        except Exception as ex:
+            raise ValueError(
+                f"[_azure_wrap_thinking_by_reasoning_content-2] {ex}"
+            ) from ex
+        return content, is_reasoning

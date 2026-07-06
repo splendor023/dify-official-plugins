@@ -1,0 +1,48 @@
+identity:
+  author: "langgenius"
+  name: "paddleocr"
+  label:
+    en_US: "PaddleOCR"
+    zh_Hans: "PaddleOCR"
+  description:
+    en_US: "PaddleOCR plugin provides several capabilities from PaddleOCR, including text recognition, document parsing, and more"
+    zh_Hans: "PaddleOCR 插件提供 PaddleOCR 的多项能力，包括文字识别、文档解析等"
+  icon: "icon.png"
+
+tags:
+    - productivity
+
+tools:
+  - tools/text_recognition.yaml
+  - tools/document_parsing.yaml
+  - tools/document_parsing_vl.yaml
+extra:
+  python:
+    source: provider/paddleocr.py
+
+credentials_for_provider:
+    aistudio_access_token:
+        type: secret-input
+        required: true
+        label:
+            en_US: AI Studio Access Token
+            zh_Hans: 星河社区访问令牌
+        placeholder:
+            en_US: AI Studio Access Token
+            zh_Hans: 请输入您的星河社区访问令牌
+        help:
+            en_US: Get your AI Studio access token
+            zh_Hans: 获取星河社区访问令牌
+        url: https://aistudio.baidu.com/index/accessToken
+    base_url:
+        type: text-input
+        required: false
+        label:
+            en_US: Base URL (Optional)
+            zh_Hans: Base URL（可选）
+        placeholder:
+            en_US: https://paddleocr.aistudio-app.com
+            zh_Hans: https://paddleocr.aistudio-app.com
+        help:
+            en_US: Leave empty to use the default PaddleOCR service. Only needed for special gateway scenarios.
+            zh_Hans: 留空则使用默认的 PaddleOCR 服务。仅特殊网关场景时需要填写。

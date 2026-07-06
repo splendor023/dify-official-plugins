@@ -1,6 +1,8 @@
+import json
 import logging
 from collections.abc import Generator
 from typing import Optional
+
 from dify_plugin.entities.model import (
     AIModelEntity,
     FetchFrom,
@@ -8,7 +10,7 @@ from dify_plugin.entities.model import (
     ModelPropertyKey,
     ModelType,
     ParameterRule,
-    ParameterType,
+    ParameterType, ModelFeature,
 )
 from dify_plugin.entities.model.llm import (
     LLMResult,
@@ -31,8 +33,6 @@ from dify_plugin.errors.model import (
     InvokeServerUnavailableError,
 )
 from dify_plugin.interfaces.model.large_language_model import LargeLanguageModel
-from volcenginesdkarkruntime.types.chat import ChatCompletion, ChatCompletionChunk
-from models.client import ArkClientV3
 from legacy.client import MaaSClient
 from legacy.errors import (
     AuthErrors,
@@ -42,11 +42,13 @@ from legacy.errors import (
     RateLimitErrors,
     ServerUnavailableErrors,
 )
+from models.client import ArkClientV3
 from models.llm.models import (
     get_model_config,
     get_v2_req_params,
     get_v3_req_params,
 )
+from volcenginesdkarkruntime.types.chat import ChatCompletion, ChatCompletionChunk
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +251,36 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
             return _handle_chat_response()
         return _handle_stream_chat_response()
 
+
+    def _wrap_thinking_by_reasoning_content(self, delta: dict, is_reasoning: bool) -> tuple[str, bool]:
+        """
+        If the reasoning response is from delta.get("reasoning_content"), we wrap
+        it with HTML think tag.
+
+        :param delta: delta dictionary from LLM streaming response
+        :param is_reasoning: is reasoning
+        :return: tuple of (processed_content, is_reasoning)
+        """
+
+        content = delta.get("content") or ""
+        reasoning_content = delta.get("reasoning_content")
+        output = content
+        if reasoning_content:
+            if not is_reasoning:
+                output = "<think>\n" + reasoning_content
+                is_reasoning = True
+            else:
+                output = reasoning_content
+        else:
+            if is_reasoning:
+                is_reasoning = False
+                if not reasoning_content:
+                    output = "\n</think>"
+                if content:
+                    output += content
+            
+        return output, is_reasoning
+
     def wrap_thinking(self, delta: dict, is_reasoning: bool) -> tuple[str, bool]:
         content = ""
         reasoning_content = None
@@ -272,6 +304,35 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
         user: str | None = None,
     ) -> LLMResult | Generator:
         client = ArkClientV3.from_credentials(credentials)
+
+        # Process structured output parameters
+        if "response_format" in model_parameters:
+            response_format = model_parameters.get("response_format")
+            if response_format == "json_schema":
+                json_schema = model_parameters.get("json_schema")
+                if not json_schema:
+                    raise ValueError(
+                        "Must define JSON Schema when the response format is json_schema"
+                    )
+                try:
+                    schema = json.loads(json_schema)
+                except Exception:
+                    raise ValueError(f"not correct json_schema format: {json_schema}")
+                model_parameters.pop("json_schema")
+                model_parameters["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": schema,
+                }
+            else:
+                model_parameters["response_format"] = {"type": response_format}
+        elif "json_schema" in model_parameters:
+            del model_parameters["json_schema"]
+
+        if "thinking" in model_parameters:
+            thinking_type = model_parameters.get("thinking")
+            if thinking_type == "disabled":
+                model_parameters["reasoning_effort"] = "minimal"
+
         req_params = get_v3_req_params(credentials, model_parameters, stop)
         if tools:
             req_params["tools"] = tools
@@ -286,6 +347,7 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
             for chunk in chunks:
                 chunk_index += 1
                 if chunk:
+                    delta_content = ""
                     if chunk.usage:
                         usage = self._calc_response_usage(
                             model=model,
@@ -319,8 +381,8 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
                     model=model,
                     prompt_messages=prompt_messages,
                     delta=LLMResultChunkDelta(
-                    index=chunk_index,
-                    message=AssistantPromptMessage(tool_calls=tools_calls, content=""),
+                        index=chunk_index,
+                        message=AssistantPromptMessage(tool_calls=tools_calls, content=""),
                     ),
                 )
 
@@ -401,6 +463,7 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
             prompt_messages=prompt_messages,
             delta=LLMResultChunkDelta(index=index, message=message, finish_reason=finish_reason, usage=usage),
         )
+
     def _extract_response_tool_calls(self, response_tool_calls: list[dict]) -> list[AssistantPromptMessage.ToolCall]:
         """
         Extract tool calls from response
@@ -422,6 +485,7 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
                 tool_calls.append(tool_call)
 
         return tool_calls
+
     def _increase_tool_call(
         self, new_tool_calls: list[AssistantPromptMessage.ToolCall], tools_calls: list[AssistantPromptMessage.ToolCall]
     ) -> list[AssistantPromptMessage.ToolCall]:
@@ -460,6 +524,7 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
             tools_calls.append(tool_call)
 
         return tool_call, tools_calls
+
     def get_customizable_model_schema(self, model: str, credentials: dict) -> Optional[AIModelEntity]:
         """
         used to define customizable model schema
@@ -474,14 +539,15 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
                     min=1,
                     max=model_config.properties.max_tokens,
                     default=512,
-                    label=I18nObject(zh_Hans="最大生成长度", en_US="Max Tokens"),
+                    label=I18nObject(zh_hans="最大生成长度", en_us="Max Tokens"),
                 ),
                 ParameterRule(
                     name="skip_moderation",
                     type=ParameterType.BOOLEAN,
                     default=False,
-                    label=I18nObject(zh_Hans="跳过内容审核", en_US="Skip Moderation"),
-                    help=I18nObject(zh_Hans="跳过内容审核，需要先联系火山引擎开通此功能", en_US="Skip Moderation, please contact Volcengine to enable this feature first"),
+                    label=I18nObject(zh_hans="跳过内容审核", en_us="Skip Moderation"),
+                    help=I18nObject(zh_hans="跳过内容审核，需要先联系火山引擎开通此功能",
+                                    en_us="Skip Moderation, please contact Volcengine to enable this feature first"),
                 ),
             ]
         else:
@@ -490,26 +556,26 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
                     name="temperature",
                     type=ParameterType.FLOAT,
                     use_template="temperature",
-                    label=I18nObject(zh_Hans="温度", en_US="Temperature"),
+                    label=I18nObject(zh_hans="温度", en_us="Temperature"),
                 ),
                 ParameterRule(
                     name="top_p",
                     type=ParameterType.FLOAT,
                     use_template="top_p",
-                    label=I18nObject(zh_Hans="Top P", en_US="Top P"),
+                    label=I18nObject(zh_hans="Top P", en_us="Top P"),
                 ),
                 ParameterRule(
                     name="top_k",
                     type=ParameterType.INT,
                     min=1,
                     default=1,
-                    label=I18nObject(zh_Hans="Top K", en_US="Top K"),
+                    label=I18nObject(zh_hans="Top K", en_us="Top K"),
                 ),
                 ParameterRule(
                     name="presence_penalty",
                     type=ParameterType.FLOAT,
                     use_template="presence_penalty",
-                    label=I18nObject(en_US="Presence Penalty", zh_Hans="存在惩罚"),
+                    label=I18nObject(en_us="Presence Penalty", zh_hans="存在惩罚"),
                     min=-2.0,
                     max=2.0,
                 ),
@@ -517,7 +583,7 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
                     name="frequency_penalty",
                     type=ParameterType.FLOAT,
                     use_template="frequency_penalty",
-                    label=I18nObject(en_US="Frequency Penalty", zh_Hans="频率惩罚"),
+                    label=I18nObject(en_us="Frequency Penalty", zh_hans="频率惩罚"),
                     min=-2.0,
                     max=2.0,
                 ),
@@ -528,14 +594,15 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
                     min=1,
                     max=model_config.properties.max_tokens,
                     default=512,
-                    label=I18nObject(zh_Hans="最大生成长度", en_US="Max Tokens"),
+                    label=I18nObject(zh_hans="最大生成长度", en_us="Max Tokens"),
                 ),
                 ParameterRule(
                     name="skip_moderation",
                     type=ParameterType.BOOLEAN,
                     default=False,
-                    label=I18nObject(zh_Hans="跳过内容审核", en_US="Skip Moderation"),
-                    help=I18nObject(zh_Hans="跳过内容审核，需要先联系火山引擎开通此功能", en_US="Skip Moderation, please contact Volcengine to enable this feature first"),
+                    label=I18nObject(zh_hans="跳过内容审核", en_us="Skip Moderation"),
+                    help=I18nObject(zh_hans="跳过内容审核，需要先联系火山引擎开通此功能",
+                                    en_us="Skip Moderation, please contact Volcengine to enable this feature first"),
                 ),
             ]
         base_model = credentials.get("base_model_name", "")
@@ -545,21 +612,70 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
                     name="thinking",
                     type=ParameterType.STRING,
                     default="enabled",
-                    label=I18nObject(zh_Hans="深度思考模式", en_US="thinking"),
+                    label=I18nObject(zh_hans="深度思考模式", en_us="thinking"),
                     options=["enabled", "disabled", "auto"],
                 )
             )
-        elif base_model.lower() in ("doubao-1.5-thinking-vision-pro", "doubao-seed-1.6-flash"):
+        elif base_model.lower() in (
+            "doubao-1.5-thinking-vision-pro",
+            "doubao-seed-1.6-flash",
+            "deepseek-v3.1",
+            "doubao-seed-1.6-vision",
+            "doubao-seed-1.6-lite",
+            "deepseek-v3.2",
+            "doubao-seed-1.8",
+            "glm-4.7",
+            "doubao-seed-2.0-pro",
+            "doubao-seed-2.0-lite",
+            "doubao-seed-2.0-mini",
+            "doubao-seed-2.0-code",
+        ):
             rules.append(
                 ParameterRule(
                     name="thinking",
                     type=ParameterType.STRING,
                     default="enabled",
-                    label=I18nObject(zh_Hans="深度思考模式", en_US="thinking"),
+                    label=I18nObject(zh_hans="深度思考模式", en_us="thinking"),
                     options=["enabled", "disabled"],
                 )
             )
-
+        if base_model.lower() in (
+            "doubao-seed-1.6-lite",
+            "doubao-seed-1.6",
+            "doubao-seed-1.8",
+            "doubao-seed-2.0-pro",
+            "doubao-seed-2.0-lite",
+            "doubao-seed-2.0-mini",
+            "doubao-seed-2.0-code",
+        ):
+            rules.append(
+                ParameterRule(
+                    name="reasoning_effort",
+                    type=ParameterType.STRING,
+                    default="medium",
+                    label=I18nObject(zh_hans="思考长度", en_us="reasoning_effort"),
+                    options=["minimal", "low", "medium", "high"],
+                )
+            )
+        # Add structured output parameters for supported models
+        if ModelFeature.STRUCTURED_OUTPUT in model_config.features:
+            rules.extend([
+                ParameterRule(
+                    name="response_format",
+                    type=ParameterType.STRING,
+                    default="text",
+                    label=I18nObject(zh_hans="响应格式", en_us="Response Format"),
+                    help=I18nObject(zh_hans="指定模型响应的格式", en_us="Specify the format of model response"),
+                    options=["text", "json_object", "json_schema"],
+                ),
+                ParameterRule(
+                    name="json_schema",
+                    type=ParameterType.STRING,
+                    label=I18nObject(zh_hans="JSON Schema", en_us="JSON Schema"),
+                    help=I18nObject(zh_hans="当response_format为json_schema时必需，定义JSON响应的结构",
+                                    en_us="Required when response_format is json_schema, defines the structure of JSON response"),
+                ),
+            ])
 
         model_properties = {}
         model_properties[ModelPropertyKey.CONTEXT_SIZE] = (
@@ -568,7 +684,7 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
         model_properties[ModelPropertyKey.MODE] = model_config.properties.mode.value
         entity = AIModelEntity(
             model=model,
-            label=I18nObject(en_US=model),
+            label=I18nObject(en_us=model),
             fetch_from=FetchFrom.CUSTOMIZABLE_MODEL,
             model_type=ModelType.LLM,
             model_properties=model_properties,

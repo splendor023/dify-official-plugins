@@ -80,7 +80,7 @@ class XinferenceSpeech2TextModel(Speech2TextModel):
         file: IO[bytes],
         language: Optional[str] = None,
         prompt: Optional[str] = None,
-        response_format: Optional[str] = "json",
+        response_format: Optional[str] = "verbose_json",
         temperature: Optional[float] = 0,
     ) -> str:
         """
@@ -120,7 +120,7 @@ class XinferenceSpeech2TextModel(Speech2TextModel):
         """
         entity = AIModelEntity(
             model=model,
-            label=I18nObject(en_US=model),
+            label=I18nObject(en_us=model),
             fetch_from=FetchFrom.CUSTOMIZABLE_MODEL,
             model_type=ModelType.SPEECH2TEXT,
             model_properties={},

@@ -1,34 +1,25 @@
-# Overview
-HAP (Hyper Application Platform), developed by 明道云 (Mingdao Cloud), is an APaaS (Application Platform as a Service) solution designed to enable enterprises to build, automate, and integrate applications with minimal or no coding. It empowers businesses to streamline operations, bridge data silos, and enhance collaboration through its robust no-code and low-code capabilities.
-You can operate worksheets in HAP using the HAP tool.
+# HAP Application Tool
 
-# Configure
-## Installation
-1. Install HAP from Dify Marketplace.
-![](./_assets/hap_install.png)
+AI-friendly hyper application platform for no-code enterprise applications and hyper-automation workflows.
 
-2. Add HAP to your workflow.
+## Features
+- Get Application Info: Get application information, including groups, worksheets, and custom pages.
+- Get Worksheet Structure: Get worksheet structure using worksheet_id.
+- List Records: List worksheet records with pagination, filtering and sorting.
+- Get Record Pivot Data: Get pivot table data for worksheet records.
+- Create Record: Create a new record in a worksheet by field ID/value mapping. Default triggers workflow.
+- Update Record: Update a record by row id in a worksheet.
+- Delete Record: Delete a record by row_id in a worksheet.
+- Get Record Details: Get record details by worksheet ID and row ID.
 
-## Tools
-### Add Worksheet Record
-![](./_assets/hap_add_worksheet_record.png)
+## Setup
+1. Install this plugin from the Dify Marketplace.
+2. Prepare the required credentials: Application Appkey, Application Sign, API Base URL (Optional, required for private deployment).
+3. Add the credentials in the plugin settings.
+4. Save the configuration.
 
-### Get Worksheet Fields
-![](./_assets/hap_add_worksheet_field.PNG)
+## Usage
+Add the HAP Application Tool tools to an agent or workflow, fill in the required inputs, and run the node to call the upstream service.
 
-### Delete Worksheet Record
-![](./_assets/hap_delete_worksheet_record.png)
-
-### Get Worksheet Pivot Data
-![](./_assets/hap_get_worksheet_pivot_data.png)
-
-### List Worksheet Records
-![](./_assets/hap_list_worksheet_records.png)
-
-### List Worksheets
-![](./_assets/hap_list_worksheets.png)
-
-Update Worksheet Record
-![](./_assets/hap_update_worksheet_record.png)
-
-For further help, please refer to the [HAP documentation](https://help.mingdao.com/worksheet/introduction/).
+## Privacy
+This plugin sends the inputs required by the selected operation to the upstream service. Review the upstream service's privacy policy before use.

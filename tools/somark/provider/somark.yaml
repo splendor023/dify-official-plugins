@@ -1,0 +1,40 @@
+credentials_for_provider:
+
+  base_url:
+    label:
+      en_US: Base URL
+      zh_Hans: Base URL
+    placeholder:
+      en_US: For SoMark API, fill in https://somark.tech/api/v1; for self-hosted deployment, fill in your local Base URL
+      zh_Hans: 使用 SoMark API 时填写 https://somark.tech/api/v1；私有化部署时填写本地部署的 Base URL
+    required: true
+    type: text-input
+
+  api_key:
+    label:
+      en_US: API Key
+      zh_Hans: API Key
+    placeholder:
+      en_US: Required for SoMark API; leave blank for self-hosted deployment
+      zh_Hans: 使用 SoMark API 时填写；私有化部署无需填写
+    required: false
+    type: secret-input
+    url: https://docs.somark.tech/documentation/api
+
+identity:
+  author: SoulCode
+  name: somark
+  label:
+    en_US: SoMark
+    zh_Hans: SoMark
+  description:
+    en_US: SoMark Document Parsing Service
+    zh_Hans: SoMark 文档解析服务
+  icon: icon.png
+
+extra:
+  python:
+    source: provider/somark.py
+
+tools:
+  - tools/extract.yaml

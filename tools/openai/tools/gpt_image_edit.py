@@ -2,11 +2,13 @@ import base64
 import io
 from collections.abc import Generator
 from typing import Any, Dict
-from openai import OpenAI
-from yarl import URL
+
 from dify_plugin.entities.tool import ToolInvokeMessage
 from dify_plugin import Tool
 from dify_plugin.file.file import File
+from openai import OpenAI
+
+from openai_client import normalize_openai_base_url
 
 class GPTImageEditTool(Tool):
     """
@@ -25,15 +27,10 @@ class GPTImageEditTool(Tool):
         )
         if not openai_organization:
             openai_organization = None
-        openai_base_url = self.runtime.credentials.get("openai_base_url", None)
-        if not openai_base_url:
-            openai_base_url = None
-        else:
-            openai_base_url = str(URL(openai_base_url) / "v1")
 
         client = OpenAI(
             api_key=self.runtime.credentials["openai_api_key"],
-            base_url=openai_base_url,
+            base_url=normalize_openai_base_url(self.runtime.credentials.get("openai_base_url")),
             organization=openai_organization,
         )
 
@@ -43,13 +40,18 @@ class GPTImageEditTool(Tool):
             yield self.create_text_message("Error: Prompt is required.")
             return
 
+        model = tool_parameters.get("model", "gpt-image-1")
+        if model not in (allowed_models := {"gpt-image-1", "gpt-image-1-mini"}):
+            yield self.create_text_message(f"Invalid model. Choose from: {', '.join(sorted(allowed_models))}.")
+            return
+
         image = tool_parameters.get("image")
         if not image:
             yield self.create_text_message("Error: Input image file is required.")
             return
         
         edit_args: Dict[str, Any] = {
-            "model": "gpt-image-1",  # Explicitly using gpt-image-1 as it supports multiple images
+            "model": model,
             "prompt": prompt,
         }
 

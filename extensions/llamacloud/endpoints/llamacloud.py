@@ -1,6 +1,6 @@
 import json
 from typing import Mapping
-from llama_cloud.client import LlamaCloud
+from llama_cloud import LlamaCloud
 from werkzeug import Request, Response
 from dify_plugin import Endpoint
 
@@ -10,6 +10,19 @@ class LlamacloudEndpoint(Endpoint):
         """
         Invokes the endpoint with the given request.
         """
+        if settings.get("api_key"):
+            if r.headers.get("Authorization") != f"Bearer {settings.get('api_key')}":
+                return Response(
+                    status=403,
+                    content_type="application/json"
+                )
+        if not r.is_json:
+            # first step of dify call is to check if the endpoint is available
+            return Response(
+                status=200,
+                content_type="application/json"
+            )
+
         # Parse JSON from the incoming request
         body = r.json
 
@@ -17,16 +30,18 @@ class LlamacloudEndpoint(Endpoint):
         query = body.get("query")
 
         # Extract retrieval settings with sensible defaults
-        retrieval_settings = body.get("retrieval_setting")
+        retrieval_settings = body.get("retrieval_setting", {})
         top_k = retrieval_settings.get("top_k")
         score_threshold = retrieval_settings.get("score_threshold")
 
         # Set up the LlamaCloud client using the API key from settings
-        client = LlamaCloud(token=settings.get("llama_cloud_api_key"))
+        client_kwargs = {"api_key": settings.get("llama_cloud_api_key")}
+        if settings.get("region") == "eu":
+            client_kwargs["base_url"] = "https://api.cloud.eu.llamaindex.ai"
+        client = LlamaCloud(**client_kwargs)
 
-        # Execute the run_search pipeline
-        # (Ensure that `pipeline_id` exists in your `settings` object)
-        response = client.pipelines.run_search(
+        # Execute the pipeline retrieval API.
+        response = client.pipelines.retrieve(
             pipeline_id=pipeline_id,
             query=query
         )

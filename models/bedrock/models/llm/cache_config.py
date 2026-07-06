@@ -7,6 +7,10 @@ logger = logging.getLogger(__name__)
 
 # Models that support prompt caching
 CACHE_SUPPORTED_MODELS = [
+    "anthropic.claude-opus-4-8",
+    "anthropic.claude-opus-4-7",
+    "anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "anthropic.claude-haiku-4-5-20251001-v1:0",
     "anthropic.claude-sonnet-4-20250514-v1:0",
     "anthropic.claude-opus-4-20250514-v1:0",
     "anthropic.claude-3-7-sonnet-20250219-v1:0",
@@ -20,6 +24,26 @@ CACHE_SUPPORTED_MODELS = [
 
 # Cache configuration for each model
 CACHE_CONFIG = {
+    "anthropic.claude-opus-4-8": {
+        "min_tokens": 4096,
+        "max_checkpoints": 4,
+        "supported_fields": ["system", "messages", "tools"]
+    },
+    "anthropic.claude-opus-4-7": {
+        "min_tokens": 4096,
+        "max_checkpoints": 4,
+        "supported_fields": ["system", "messages", "tools"]
+    },
+    "anthropic.claude-sonnet-4-5-20250929-v1:0": {
+        "min_tokens": 1024,
+        "max_checkpoints": 4,
+        "supported_fields": ["system", "messages", "tools"]
+    },
+    "anthropic.claude-haiku-4-5-20251001-v1:0": {
+        "min_tokens": 4096,
+        "max_checkpoints": 4,
+        "supported_fields": ["system", "messages", "tools"]
+    },
     "anthropic.claude-sonnet-4-20250514-v1:0": {
         "min_tokens": 1024,
         "max_checkpoints": 4,
@@ -86,7 +110,6 @@ def get_cache_config(model_id: str) -> dict:
 
     if model_id in CACHE_CONFIG:
         config = CACHE_CONFIG[model_id]
-        print(f"[CACHE CONFIG] Cache config for model {model_id}: {config}")
         logger.info(f"[CACHE CONFIG] Cache config for model {model_id}: {config}")
         return config
 
@@ -96,6 +119,5 @@ def get_cache_config(model_id: str) -> dict:
         "max_checkpoints": 4,
         "supported_fields": ["system", "messages"]
     }
-    print(f"[CACHE CONFIG] Using default cache config for model {model_id}: {default_config}")
     logger.info(f"[CACHE CONFIG] Using default cache config for model {model_id}: {default_config}")
     return default_config

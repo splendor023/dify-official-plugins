@@ -1,0 +1,19 @@
+[project]
+name = "dify-sagemaker"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+
+# Managed with uv; refresh the lockfile with `uv lock`.
+dependencies = [
+    "boto3>=1.43.13",
+    "botocore>=1.43.13",
+    "dify_plugin>=0.9.0",
+    "requests>=2.33.1",
+    "sagemaker>=2.243.2,<2.256.1",
+]
+
+# uv run black . -C -l 100 && uv run ruff check --fix
+[dependency-groups]
+dev = []

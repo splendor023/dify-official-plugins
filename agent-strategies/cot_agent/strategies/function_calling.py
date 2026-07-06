@@ -39,6 +39,42 @@ class LogMetadata:
     CURRENCY = "currency"
     TOTAL_TOKENS = "total_tokens"
 
+class ExecutionMetadata(BaseModel):
+    """Execution metadata with default values"""
+    total_price: float = 0.0
+    currency: str = ""
+    total_tokens: int = 0
+    prompt_tokens: int = 0
+    prompt_unit_price: float = 0.0
+    prompt_price_unit: float = 0.0
+    prompt_price: float = 0.0
+    completion_tokens: int = 0
+    completion_unit_price: float = 0.0
+    completion_price_unit: float = 0.0
+    completion_price: float = 0.0
+    latency: float = 0.0
+    
+    @classmethod
+    def from_llm_usage(cls, usage: Optional[LLMUsage]) -> "ExecutionMetadata":
+        """Create ExecutionMetadata from LLMUsage, handling None case"""
+        if usage is None:
+            return cls()
+        
+        return cls(
+            total_price=float(usage.total_price),
+            currency=usage.currency,
+            total_tokens=usage.total_tokens,
+            prompt_tokens=usage.prompt_tokens,
+            prompt_unit_price=float(usage.prompt_unit_price),
+            prompt_price_unit=float(usage.prompt_price_unit),
+            prompt_price=float(usage.prompt_price),
+            completion_tokens=usage.completion_tokens,
+            completion_unit_price=float(usage.completion_unit_price),
+            completion_price_unit=float(usage.completion_price_unit),
+            completion_price=float(usage.completion_price),
+            latency=usage.latency
+        )
+
 class ContextItem(BaseModel):
     content: str
     title: str
@@ -122,15 +158,11 @@ class FunctionCallingAgentStrategy(AgentStrategy):
             )
             yield round_log
 
-            # If max_iteration_steps=1, need to execute tool calls
-            if iteration_step == max_iteration_steps and max_iteration_steps > 1:
-                # the last iteration, remove all tools
-                prompt_messages_tools = []
-
             # recalc llm max tokens
             prompt_messages = self._organize_prompt_messages(
                 history_prompt_messages=history_prompt_messages,
                 current_thoughts=current_thoughts,
+                model=model,
             )
             if model.entity and model.completion_params:
                 self.recalc_llm_max_tokens(
@@ -260,7 +292,28 @@ class FunctionCallingAgentStrategy(AgentStrategy):
                 },
             )
 
-            if response.strip():
+            # If there are tool calls, merge all tool calls into a single assistant message
+            if tool_calls:
+                tool_call_objects = [
+                    AssistantPromptMessage.ToolCall(
+                        id=tool_call_id,
+                        type="function",
+                        function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                            name=tool_call_name,
+                            arguments=json.dumps(
+                                tool_call_args, ensure_ascii=False
+                            ),
+                        ),
+                    )
+                    for tool_call_id, tool_call_name, tool_call_args in tool_calls
+                ]
+                assistant_message = AssistantPromptMessage(
+                    content=response,  # Preserve LLM returned content, even if empty
+                    tool_calls=tool_call_objects
+                )
+                current_thoughts.append(assistant_message)
+            elif response.strip():
+                # If no tool calls but has response, add a regular assistant message
                 assistant_message = AssistantPromptMessage(
                     content=response, tool_calls=[]
                 )
@@ -270,178 +323,232 @@ class FunctionCallingAgentStrategy(AgentStrategy):
 
             # call tools
             tool_responses = []
-            for tool_call_id, tool_call_name, tool_call_args in tool_calls:
-                current_thoughts.append(
-                    AssistantPromptMessage(
-                        content="",
-                        tool_calls=[
-                            AssistantPromptMessage.ToolCall(
-                                id=tool_call_id,
-                                type="function",
-                                function=AssistantPromptMessage.ToolCall.ToolCallFunction(
-                                    name=tool_call_name,
-                                    arguments=json.dumps(
-                                        tool_call_args, ensure_ascii=False
-                                    ),
-                                ),
-                            )
-                        ],
-                    )
-                )
-                tool_instance = tool_instances[tool_call_name]
-                tool_call_started_at = time.perf_counter()
-                tool_call_log = self.create_log_message(
-                    label=f"CALL {tool_call_name}",
-                    data={},
-                    metadata={
-                        LogMetadata.STARTED_AT: time.perf_counter(),
-                        LogMetadata.PROVIDER: tool_instance.identity.provider,
-                    },
-                    parent=round_log,
-                    status=ToolInvokeMessage.LogMessage.LogStatus.START,
-                )
-                yield tool_call_log
-                if not tool_instance:
-                    tool_response = {
-                        "tool_call_id": tool_call_id,
-                        "tool_call_name": tool_call_name,
-                        "tool_response": f"there is not a tool named {tool_call_name}",
-                        "meta": ToolInvokeMeta.error_instance(
-                            f"there is not a tool named {tool_call_name}"
-                        ).to_dict(),
-                    }
-                else:
-                    # invoke tool
-                    try:
-                        tool_invoke_responses = self.session.tool.invoke(
-                            provider_type=ToolProviderType(tool_instance.provider_type),
-                            provider=tool_instance.identity.provider,
-                            tool_name=tool_instance.identity.name,
-                            parameters={
-                                **tool_instance.runtime_parameters,
-                                **tool_call_args,
-                            },
-                        )
-                        tool_result = ""
-                        for tool_invoke_response in tool_invoke_responses:
-                            if (
-                                tool_invoke_response.type
-                                == ToolInvokeMessage.MessageType.TEXT
-                            ):
-                                tool_result += cast(
-                                    ToolInvokeMessage.TextMessage,
-                                    tool_invoke_response.message,
-                                ).text
-                            elif (
-                                tool_invoke_response.type
-                                == ToolInvokeMessage.MessageType.LINK
-                            ):
-                                tool_result += (
-                                    "result link: "
-                                    + cast(
-                                        ToolInvokeMessage.TextMessage,
-                                        tool_invoke_response.message,
-                                    ).text
-                                    + "."
-                                    + " please tell user to check it."
-                                )
-                            elif tool_invoke_response.type in {
-                                ToolInvokeMessage.MessageType.IMAGE_LINK,
-                                ToolInvokeMessage.MessageType.IMAGE,
-                            }:
-                                # Extract the file path or URL from the message
-                                if hasattr(tool_invoke_response.message, "text"):
-                                    file_info = cast(
-                                        ToolInvokeMessage.TextMessage,
-                                        tool_invoke_response.message,
-                                    ).text
-                                    # Try to create a blob message with the file content
-                                    try:
-                                        # If it's a local file path, try to read it
-                                        if file_info.startswith("/files/"):
-                                            import os
-
-                                            if os.path.exists(file_info):
-                                                with open(file_info, "rb") as f:
-                                                    file_content = f.read()
-                                                # Create a blob message with the file content
-                                                blob_response = self.create_blob_message(
-                                                    blob=file_content,
-                                                    meta={
-                                                        "mime_type": "image/png",
-                                                        "filename": os.path.basename(
-                                                            file_info
-                                                        ),
-                                                    },
-                                                )
-                                                yield blob_response
-                                    except Exception as e:
-                                        yield self.create_text_message(
-                                            f"Failed to create blob message: {e}"
-                                        )
-                                tool_result += (
-                                    "image has been created and sent to user already, "
-                                    + "you do not need to create it, just tell the user to check it now."
-                                )
-                                # TODO: convert to agent invoke message
-                                yield tool_invoke_response
-                            elif (
-                                tool_invoke_response.type
-                                == ToolInvokeMessage.MessageType.JSON
-                            ):
-                                text = json.dumps(
-                                    cast(
-                                        ToolInvokeMessage.JsonMessage,
-                                        tool_invoke_response.message,
-                                    ).json_object,
-                                    ensure_ascii=False,
-                                )
-                                tool_result += f"tool response: {text}."
-                            elif (
-                                tool_invoke_response.type
-                                == ToolInvokeMessage.MessageType.BLOB
-                            ):
-                                tool_result += "Generated file ... "
-                                # TODO: convert to agent invoke message
-                                yield tool_invoke_response
-                            else:
-                                tool_result += (
-                                    f"tool response: {tool_invoke_response.message!r}."
-                                )
-                    except Exception as e:
-                        tool_result = f"tool invoke error: {e!s}"
-                    tool_response = {
-                        "tool_call_id": tool_call_id,
-                        "tool_call_name": tool_call_name,
-                        "tool_call_input": {
-                            **tool_instance.runtime_parameters,
-                            **tool_call_args,
+            # Check if max iterations reached (but allow tool calls when max_iteration_steps == 1)
+            if tool_calls and iteration_step == max_iteration_steps and max_iteration_steps > 1:
+                # Max iterations reached, return message instead of calling tools
+                for tool_call_id, tool_call_name, tool_call_args in tool_calls:
+                    # Create log entry for the skipped tool call
+                    tool_call_started_at = time.perf_counter()
+                    tool_call_log = self.create_log_message(
+                        label=f"CALL {tool_call_name}",
+                        data={},
+                        metadata={
+                            LogMetadata.STARTED_AT: time.perf_counter(),
+                            LogMetadata.PROVIDER: tool_instances[tool_call_name].identity.provider
+                            if tool_instances.get(tool_call_name)
+                            else "",
                         },
-                        "tool_response": tool_result,
-                    }
+                        parent=round_log,
+                        status=ToolInvokeMessage.LogMessage.LogStatus.START,
+                    )
+                    yield tool_call_log
 
-                yield self.finish_log_message(
-                    log=tool_call_log,
-                    data={
-                        "output": tool_response,
-                    },
-                    metadata={
-                        LogMetadata.STARTED_AT: tool_call_started_at,
-                        LogMetadata.PROVIDER: tool_instance.identity.provider,
-                        LogMetadata.FINISHED_AT: time.perf_counter(),
-                        LogMetadata.ELAPSED_TIME: time.perf_counter()
-                        - tool_call_started_at,
-                    },
-                )
-                tool_responses.append(tool_response)
-                if tool_response["tool_response"] is not None:
+                    # Return error message instead of calling tool
+                    tool_response = {
+                        "tool_call_id": tool_call_id,
+                        "tool_call_name": tool_call_name,
+                        "tool_response": (
+                            f"Maximum iteration limit ({max_iteration_steps}) reached. "
+                            f"Cannot call tool '{tool_call_name}'. "
+                            f"Please consider increasing the iteration limit."
+                        ),
+                    }
+                    tool_responses.append(tool_response)
+
+                    yield self.finish_log_message(
+                        log=tool_call_log,
+                        data={"output": tool_response},
+                        metadata={
+                            LogMetadata.STARTED_AT: tool_call_started_at,
+                            LogMetadata.PROVIDER: tool_instances[tool_call_name].identity.provider
+                            if tool_instances.get(tool_call_name)
+                            else "",
+                            LogMetadata.FINISHED_AT: time.perf_counter(),
+                            LogMetadata.ELAPSED_TIME: time.perf_counter() - tool_call_started_at,
+                        },
+                    )
+
+                    # Add to current_thoughts for context
+                    current_thoughts.append(
+                        AssistantPromptMessage(
+                            content="",
+                            tool_calls=[
+                                AssistantPromptMessage.ToolCall(
+                                    id=tool_call_id,
+                                    type="function",
+                                    function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                                        name=tool_call_name,
+                                        arguments=json.dumps(
+                                            tool_call_args, ensure_ascii=False
+                                        ),
+                                    ),
+                                )
+                            ],
+                        )
+                    )
                     current_thoughts.append(
                         ToolPromptMessage(
-                            content=str(tool_response["tool_response"]),
+                            content=tool_response["tool_response"],
                             tool_call_id=tool_call_id,
                             name=tool_call_name,
                         )
                     )
+            else:
+                for tool_call_id, tool_call_name, tool_call_args in tool_calls:
+                    tool_instance = tool_instances[tool_call_name]
+                    tool_call_started_at = time.perf_counter()
+                    tool_call_log = self.create_log_message(
+                        label=f"CALL {tool_call_name}",
+                        data={},
+                        metadata={
+                            LogMetadata.STARTED_AT: time.perf_counter(),
+                            LogMetadata.PROVIDER: tool_instance.identity.provider,
+                        },
+                        parent=round_log,
+                        status=ToolInvokeMessage.LogMessage.LogStatus.START,
+                    )
+                    yield tool_call_log
+                    if not tool_instance:
+                        tool_response = {
+                            "tool_call_id": tool_call_id,
+                            "tool_call_name": tool_call_name,
+                            "tool_response": f"there is not a tool named {tool_call_name}",
+                            "meta": ToolInvokeMeta.error_instance(
+                                f"there is not a tool named {tool_call_name}"
+                            ).to_dict(),
+                        }
+                    else:
+                        # invoke tool
+                        try:
+                            tool_invoke_responses = self.session.tool.invoke(
+                                provider_type=ToolProviderType(tool_instance.provider_type),
+                                provider=tool_instance.identity.provider,
+                                tool_name=tool_instance.identity.name,
+                                parameters={
+                                    **tool_instance.runtime_parameters,
+                                    **tool_call_args,
+                                },
+                            )
+                            tool_result = ""
+                            for tool_invoke_response in tool_invoke_responses:
+                                if (
+                                    tool_invoke_response.type
+                                    == ToolInvokeMessage.MessageType.TEXT
+                                ):
+                                    tool_result += cast(
+                                        ToolInvokeMessage.TextMessage,
+                                        tool_invoke_response.message,
+                                    ).text
+                                elif (
+                                    tool_invoke_response.type
+                                    == ToolInvokeMessage.MessageType.LINK
+                                ):
+                                    tool_result += (
+                                        "result link: "
+                                        + cast(
+                                            ToolInvokeMessage.TextMessage,
+                                            tool_invoke_response.message,
+                                        ).text
+                                        + "."
+                                        + " please tell user to check it."
+                                    )
+                                elif tool_invoke_response.type in {
+                                    ToolInvokeMessage.MessageType.IMAGE_LINK,
+                                    ToolInvokeMessage.MessageType.IMAGE,
+                                }:
+                                    # Extract the file path or URL from the message
+                                    if hasattr(tool_invoke_response.message, "text"):
+                                        file_info = cast(
+                                            ToolInvokeMessage.TextMessage,
+                                            tool_invoke_response.message,
+                                        ).text
+                                        # Try to create a blob message with the file content
+                                        try:
+                                            # If it's a local file path, try to read it
+                                            if file_info.startswith("/files/"):
+                                                import os
+
+                                                if os.path.exists(file_info):
+                                                    with open(file_info, "rb") as f:
+                                                        file_content = f.read()
+                                                    # Create a blob message with the file content
+                                                    blob_response = self.create_blob_message(
+                                                        blob=file_content,
+                                                        meta={
+                                                            "mime_type": "image/png",
+                                                            "filename": os.path.basename(
+                                                                file_info
+                                                            ),
+                                                        },
+                                                    )
+                                                    yield blob_response
+                                        except Exception as e:
+                                            yield self.create_text_message(
+                                                f"Failed to create blob message: {e}"
+                                            )
+                                    tool_result += (
+                                        "image has been created and sent to user already, "
+                                        + "you do not need to create it, just tell the user to check it now."
+                                    )
+                                    # TODO: convert to agent invoke message
+                                    yield tool_invoke_response
+                                elif (
+                                    tool_invoke_response.type
+                                    == ToolInvokeMessage.MessageType.JSON
+                                ):
+                                    text = json.dumps(
+                                        cast(
+                                            ToolInvokeMessage.JsonMessage,
+                                            tool_invoke_response.message,
+                                        ).json_object,
+                                        ensure_ascii=False,
+                                    )
+                                    tool_result += f"tool response: {text}."
+                                elif (
+                                    tool_invoke_response.type
+                                    == ToolInvokeMessage.MessageType.BLOB
+                                ):
+                                    tool_result += "Generated file ... "
+                                    # TODO: convert to agent invoke message
+                                    yield tool_invoke_response
+                                else:
+                                    tool_result += (
+                                        f"tool response: {tool_invoke_response.message!r}."
+                                    )
+                        except Exception as e:
+                            tool_result = f"tool invoke error: {e!s}"
+                        tool_response = {
+                            "tool_call_id": tool_call_id,
+                            "tool_call_name": tool_call_name,
+                            "tool_call_input": {
+                                **tool_instance.runtime_parameters,
+                                **tool_call_args,
+                            },
+                            "tool_response": tool_result,
+                        }
+
+                    yield self.finish_log_message(
+                        log=tool_call_log,
+                        data={
+                            "output": tool_response,
+                        },
+                        metadata={
+                            LogMetadata.STARTED_AT: tool_call_started_at,
+                            LogMetadata.PROVIDER: tool_instance.identity.provider,
+                            LogMetadata.FINISHED_AT: time.perf_counter(),
+                            LogMetadata.ELAPSED_TIME: time.perf_counter()
+                            - tool_call_started_at,
+                        },
+                    )
+                    tool_responses.append(tool_response)
+                    if tool_response["tool_response"] is not None:
+                        current_thoughts.append(
+                            ToolPromptMessage(
+                                content=str(tool_response["tool_response"]),
+                                tool_call_id=tool_call_id,
+                                name=tool_call_name,
+                            )
+                        )
             # After handling all tool calls, insert a blank line so the next assistant thought
             # appears on a new line in the user interface.
             if tool_calls:
@@ -508,19 +615,10 @@ class FunctionCallingAgentStrategy(AgentStrategy):
                 context="",
             )
 
+        metadata = ExecutionMetadata.from_llm_usage(llm_usage["usage"])
         yield self.create_json_message(
             {
-                "execution_metadata": {
-                    LogMetadata.TOTAL_PRICE: llm_usage["usage"].total_price
-                    if llm_usage["usage"] is not None
-                    else 0,
-                    LogMetadata.CURRENCY: llm_usage["usage"].currency
-                    if llm_usage["usage"] is not None
-                    else "",
-                    LogMetadata.TOTAL_TOKENS: llm_usage["usage"].total_tokens
-                    if llm_usage["usage"] is not None
-                    else 0,
-                }
+                "execution_metadata": metadata.model_dump()
             }
         )
 
@@ -536,6 +634,20 @@ class FunctionCallingAgentStrategy(AgentStrategy):
         """
         return bool(llm_result.message.tool_calls)
 
+    @staticmethod
+    def _parse_tool_call_arguments(arguments: str | None) -> dict[str, Any]:
+        if not arguments:
+            return {}
+        try:
+            return json.loads(arguments)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Failed to parse tool-call arguments as JSON (error at position {e.pos}). "
+                f"This often happens when the model's output is truncated or malformed mid-generation. "
+                f"If using Claude with Thinking enabled, try increasing your 'max_tokens' or "
+                f"reducing your 'thinking_budget' in model settings."
+            ) from e
+
     def extract_tool_calls(
         self, llm_result_chunk: LLMResultChunk
     ) -> list[tuple[str, str, dict[str, Any]]]:
@@ -547,9 +659,7 @@ class FunctionCallingAgentStrategy(AgentStrategy):
         """
         tool_calls = []
         for prompt_message in llm_result_chunk.delta.message.tool_calls:
-            args = {}
-            if prompt_message.function.arguments != "":
-                args = json.loads(prompt_message.function.arguments)
+            args = self._parse_tool_call_arguments(prompt_message.function.arguments)
 
             tool_calls.append(
                 (
@@ -572,9 +682,7 @@ class FunctionCallingAgentStrategy(AgentStrategy):
         """
         tool_calls = []
         for prompt_message in llm_result.message.tool_calls:
-            args = {}
-            if prompt_message.function.arguments != "":
-                args = json.loads(prompt_message.function.arguments)
+            args = self._parse_tool_call_arguments(prompt_message.function.arguments)
 
             tool_calls.append(
                 (
@@ -610,8 +718,13 @@ class FunctionCallingAgentStrategy(AgentStrategy):
         self, prompt_messages: list[PromptMessage]
     ) -> list[PromptMessage]:
         """
-        As for now, gpt supports both fc and vision at the first iteration.
-        We need to remove the image messages from the prompt messages at the first iteration.
+        Clear image messages from prompt messages.
+        Converts image content to "[image]" placeholder text.
+
+        This is needed because:
+        1. Some models don't support vision at all
+        2. Some models support vision in the first iteration but not in subsequent iterations
+            (when tool calls are involved)
         """
         prompt_messages = deepcopy(prompt_messages)
 
@@ -636,12 +749,22 @@ class FunctionCallingAgentStrategy(AgentStrategy):
         self,
         current_thoughts: list[PromptMessage],
         history_prompt_messages: list[PromptMessage],
+        model: AgentModelConfig | None = None,
     ) -> list[PromptMessage]:
         prompt_messages = [
             *history_prompt_messages,
             *current_thoughts,
         ]
-        if len(current_thoughts) != 0:
-            # clear messages after the first iteration
+
+        # Check if model supports vision
+        supports_vision = (
+            ModelFeature.VISION in model.entity.features
+            if model and model.entity and model.entity.features
+            else False
+        )
+
+        # Clear images if: model doesn't support vision OR it's not the first iteration
+        if not supports_vision or len(current_thoughts) != 0:
             prompt_messages = self._clear_user_prompt_image_messages(prompt_messages)
+
         return prompt_messages

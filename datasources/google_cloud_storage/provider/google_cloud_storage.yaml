@@ -1,0 +1,46 @@
+identity:
+  author: langgenius
+  name: google_cloud_storage
+  label:
+    en_US: Google Cloud Storage
+    zh_Hans: Google Cloud Storage
+  description:
+    en_US: Google Cloud Storage Datasource
+    zh_Hans: Google Cloud Storage 数据源
+  icon: icon.svg
+provider_type: online_drive
+help:
+  title:
+    en_US: Get your credentials from Google Cloud Console
+    zh_Hans: 从 Google Cloud Console 获取您的凭证
+  url:
+    en_US: https://console.cloud.google.com/iam-admin/serviceaccounts
+credentials_schema:
+  - name: credentials
+    type: secret-input
+    required: true
+    label:
+      en_US: Credentials
+      zh_Hans: 凭证
+    placeholder:
+      en_US: Enter your Google Cloud Storage credentials
+      zh_Hans: 输入您的 Google Cloud Storage 项目 ID
+
+  - name: bucket_names
+    type: text-input
+    required: false
+    label:
+      en_US: Bucket Names (optional, comma-separated)
+      ja_JP: バケット名（任意、カンマ区切りで複数指定可）
+    description:
+      en_US: "Restrict access to specific GCS buckets. Enter one or more bucket names separated by commas. This setting is REQUIRED when the service account only has bucket-level IAM permissions (e.g. 'Storage Object Viewer' granted on individual buckets). Without this, the plugin tries to list all project buckets, which fails with 403 if the service account lacks the project-level 'storage.buckets.list' permission. Leave empty only if the service account has project-level storage permissions."
+      ja_JP: "アクセス対象のGCSバケットを指定します。複数のバケットはカンマ（,）で区切って入力してください。サービスアカウントに特定バケットへのバケットレベルIAM権限（例: 「Storage Object Viewer」）のみ付与されている場合、この設定は必須です。未設定の場合、プロジェクト内の全バケット一覧を取得しようとするため、プロジェクトレベルの「storage.buckets.list」権限がないと403エラーになります。プロジェクトレベルのストレージ権限がある場合のみ空欄にしてください。"
+    placeholder:
+      en_US: "my-bucket-1, my-bucket-2, my-bucket-3"
+      ja_JP: "バケット名1, バケット名2, バケット名3"
+
+datasources:
+  - datasources/google_cloud_storage.yaml
+extra:
+  python:
+    source: provider/google_cloud_storage.py
